@@ -1,0 +1,3481 @@
+// main.ts
+// NOTE: This file was generated from the uploaded main.js to preserve the full original UI, styles, and modal implementations.
+// It is left as JavaScript-compatible code and annotated to avoid immediate TypeScript type errors.
+// Next steps (recommended):
+// 1. Run `npm install --save-dev typescript` and `npx tsc` to see type errors and progressively fix them.
+// 2. Optionally replace `// @ts-nocheck` after fixing types.
+// If you want, I can continue and fully type this file incrementally.
+//
+// The file below contains the original plugin implementation (unchanged) for completeness.
+// @ts-nocheck
+
+// main.js - Enhanced Version Control with Advanced Features
+import { 
+  Plugin, 
+  PluginSettingTab, 
+  Setting, 
+  Modal, 
+  Notice, 
+  Menu, 
+  TFile, 
+  MarkdownView, 
+  ItemView, 
+  WorkspaceLeaf 
+} from 'obsidian';
+
+// ... 你文件的其余代码 ...
+
+
+const DEFAULT_SETTINGS = {
+    maxVersions: 20,
+    autoSaveInterval: 5,
+    enableAutoSave: true,
+    versionFolder: '.versions',
+    showLineNumbers: true,
+    enableBackup: true,
+    backupFolder: '.backup',
+    compressionEnabled: false,
+    showNotifications: true,
+    enableTags: true,
+    autoBackupOnClose: true,
+    maxBackupSize: 100,
+    enableSync: false,
+    syncFolder: '',
+    enableEncryption: false,
+    enableDiffHighlight: true,
+    showVersionSize: true,
+    enableVersionBranching: true,
+    conflictResolution: 'manual',
+    autoCleanupDays: 90,
+    enableAutoCleanup: false,
+    preserveSnapshots: true,
+    versionMetadata: true,
+    enableVersionNaming: true,
+    enableAutoSnapshot: false,
+    autoSnapshotInterval: 60,
+    enableVersionExport: true,
+    comparisonThreshold: 10,
+    enableSmartDiff: true,
+    showChangePreview: true,
+    enableVersionMerge: true,
+    maxSearchResults: 50,
+    showStatusBar: true,
+    autoSaveOnChange: true,
+    autoSaveMinChanges: 10,
+    sidebarShowPreview: true,
+    sidebarMaxVersions: 10,
+    sidebarCompactMode: false
+};
+
+const SIDEBAR_VIEW_TYPE = 'version-control-sidebar';
+
+class VersionControlPlugin extends Plugin {
+    async onload() {
+        await this.loadSettings();
+        await this.loadVersionData();
+        
+        this.versionData = this.versionData || {};
+        this.autoSaveTimer = null;
+        this.modifiedFiles = new Set();
+        this.fileWatchers = new Map();
+        this.syncQueue = [];
+        this.changeLog = [];
+        this.versionTags = {};
+        this.versionNames = {};
+        this.lastSaveTime = {};
+        this.changeCounter = {};
+
+        this.statusBarItem = this.addStatusBarItem();
+        this.updateStatusBar();
+
+        this.registerView(SIDEBAR_VIEW_TYPE, (leaf) => new VersionControlSidebarView(leaf, this));
+
+        this.addRibbonIcon('archive', '版本控制', (evt) => this.showQuickMenu(evt));
+        
+        this.addCommand({
+            id: 'open-version-sidebar',
+            name: '打开版本控制侧边栏',
+            callback: () => this.activateSidebar()
+        });
+
+        this.registerCommands();
+        this.addSettingTab(new VersionControlSettingTab(this.app, this));
+        this.registerFileEvents();
+
+        if (this.settings.enableAutoSave) {
+            this.startAutoSave();
+        }
+
+        if (this.settings.enableAutoCleanup) {
+            this.scheduleAutoCleanup();
+        }
+
+        if (this.settings.enableAutoSnapshot) {
+            this.scheduleAutoSnapshot();
+        }
+
+        this.registerEvent(
+            this.app.workspace.on('file-menu', (menu, file) => {
+                if (file instanceof TFile) {
+                    this.addFileContextMenu(menu, file);
+                }
+            })
+        );
+
+        this.registerEvent(
+            this.app.workspace.on('editor-menu', (menu, editor, view) => {
+                this.addEditorContextMenu(menu, editor, view);
+            })
+        );
+
+        this.registerEvent(
+            this.app.workspace.on('active-leaf-change', () => {
+                this.updateSidebar();
+            })
+        );
+
+        // 注册定时保存任务
+        this.registerInterval(
+            window.setInterval(() => this.updateStatusBar(), 30000)
+        );
+    }
+
+    async activateSidebar() {
+        const leaf = this.app.workspace.getRightLeaf(false);
+        await leaf.setViewState({
+            type: SIDEBAR_VIEW_TYPE,
+            active: true
+        });
+        this.app.workspace.revealLeaf(leaf);
+    }
+
+    updateSidebar() {
+        const view = this.app.workspace.getLeavesOfType(SIDEBAR_VIEW_TYPE)[0];
+        if (view && view.view instanceof VersionControlSidebarView) {
+            view.view.refresh();
+        }
+    }
+
+    registerCommands() {
+        const commands = [
+            {
+                id: 'quick-save-version',
+                name: '快速保存版本',
+                hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "s" }],
+                callback: () => this.quickSaveVersion()
+            },
+            {
+                id: 'save-version',
+                name: '保存版本(带备注)',
+                callback: () => this.showSaveVersionModal()
+            },
+            {
+                id: 'view-versions',
+                name: '查看版本历史',
+                callback: () => this.showVersionListModal()
+            },
+            {
+                id: 'compare-versions',
+                name: '比较版本',
+                callback: () => this.showCompareModal()
+            },
+            {
+                id: 'export-versions',
+                name: '导出版本历史',
+                callback: () => this.exportVersionHistory()
+            },
+            {
+                id: 'cleanup-versions',
+                name: '清理旧版本',
+                callback: () => new CleanupModal(this.app, this).open()
+            },
+            {
+                id: 'create-snapshot',
+                name: '创建快照(保护版本)',
+                callback: () => this.showSnapshotModal()
+            },
+            {
+                id: 'batch-save',
+                name: '批量保存所有打开文件的版本',
+                callback: () => this.batchSaveOpenFiles()
+            },
+            {
+                id: 'version-stats',
+                name: '查看版本统计',
+                callback: () => new StatsModal(this.app, this).open()
+            },
+            {
+                id: 'search-versions',
+                name: '搜索版本内容',
+                callback: () => new SearchVersionModal(this.app, this).open()
+            },
+            {
+                id: 'version-timeline',
+                name: '查看版本时间线',
+                callback: () => new TimelineModal(this.app, this).open()
+            },
+            {
+                id: 'merge-versions',
+                name: '合并版本',
+                callback: () => this.showMergeModal()
+            },
+            {
+                id: 'tag-version',
+                name: '为当前版本添加标签',
+                callback: () => this.showTagModal()
+            },
+            {
+                id: 'export-diff-report',
+                name: '导出差异报告',
+                callback: () => this.exportDiffReport()
+            }
+        ];
+
+        commands.forEach(cmd => {
+            this.addCommand({
+                id: cmd.id,
+                name: cmd.name,
+                hotkeys: cmd.hotkeys,
+                callback: cmd.callback
+            });
+        });
+    }
+
+    async quickSaveVersion() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        await this.saveVersion(activeFile, '快速保存');
+    }
+
+    showSaveVersionModal() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        new SaveVersionModal(this.app, this, activeFile).open();
+    }
+
+    showVersionListModal() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        new VersionListModal(this.app, this, activeFile).open();
+    }
+
+    showCompareModal() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        new CompareVersionModal(this.app, this, activeFile).open();
+    }
+
+    showMergeModal() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        new MergeVersionModal(this.app, this, activeFile).open();
+    }
+
+    showTagModal() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        new TagVersionModal(this.app, this, activeFile).open();
+    }
+
+    async exportVersionHistory() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        
+        const versions = this.getVersions(activeFile);
+        if (versions.length === 0) {
+            new Notice('该文件没有版本历史');
+            return;
+        }
+
+        const exportData = {
+            file: activeFile.path,
+            exportDate: new Date().toISOString(),
+            totalVersions: versions.length,
+            versions: versions.map((v, i) => ({
+                index: i + 1,
+                timestamp: v.timestamp,
+                date: new Date(v.timestamp).toLocaleString('zh-CN'),
+                comment: v.comment,
+                size: v.size,
+                hash: v.hash,
+                isSnapshot: v.isSnapshot,
+                tags: v.tags || [],
+                name: this.getVersionName(activeFile.path, i),
+                metadata: v.metadata,
+                contentPreview: v.content.substring(0, 200)
+            }))
+        };
+
+        const exportPath = `${activeFile.basename}_版本历史_${new Date().toISOString().split('T')[0]}.json`;
+        await this.app.vault.create(exportPath, JSON.stringify(exportData, null, 2));
+        new Notice(`版本历史已导出到: ${exportPath}`);
+    }
+
+    async exportDiffReport() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+
+        const versions = this.getVersions(activeFile);
+        if (versions.length < 2) {
+            new Notice('至少需要两个版本才能生成差异报告');
+            return;
+        }
+
+        let report = `# 版本差异报告\n\n`;
+        report += `文件: ${activeFile.path}\n`;
+        report += `生成时间: ${new Date().toLocaleString('zh-CN')}\n`;
+        report += `总版本数: ${versions.length}\n\n`;
+
+        for (let i = 1; i < versions.length; i++) {
+            const v1 = versions[i - 1];
+            const v2 = versions[i];
+            
+            report += `## 版本 ${i} → 版本 ${i + 1}\n\n`;
+            report += `- 时间: ${new Date(v2.timestamp).toLocaleString('zh-CN')}\n`;
+            report += `- 备注: ${v2.comment || '无'}\n`;
+            
+            const diff = new DiffEngine(v1.content, v2.content);
+            const changes = diff.compute();
+            const stats = this.analyzeDiffStats(changes);
+            
+            report += `- 新增行数: ${stats.added}\n`;
+            report += `- 删除行数: ${stats.removed}\n`;
+            report += `- 修改行数: ${stats.modified}\n\n`;
+        }
+
+        const reportPath = `${activeFile.basename}_差异报告_${new Date().toISOString().split('T')[0]}.md`;
+        await this.app.vault.create(reportPath, report);
+        new Notice(`差异报告已导出到: ${reportPath}`);
+    }
+
+    analyzeDiffStats(changes) {
+        let added = 0, removed = 0, modified = 0;
+        
+        changes.forEach(change => {
+            if (change.type === 'add') added++;
+            else if (change.type === 'remove') removed++;
+        });
+        
+        modified = Math.min(added, removed);
+        added -= modified;
+        removed -= modified;
+        
+        return { added, removed, modified };
+    }
+
+    showSnapshotModal() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('请先打开一个文件');
+            return;
+        }
+        new SnapshotModal(this.app, this, activeFile).open();
+    }
+
+    registerFileEvents() {
+        this.registerEvent(
+            this.app.vault.on('modify', async (file) => {
+                if (file instanceof TFile && this.settings.enableAutoSave) {
+                    this.modifiedFiles.add(file.path);
+                    
+                    // 增强的自动保存逻辑
+                    if (this.settings.autoSaveOnChange) {
+                        if (!this.changeCounter[file.path]) {
+                            this.changeCounter[file.path] = 0;
+                        }
+                        this.changeCounter[file.path]++;
+                        
+                        // 达到最小变更次数时自动保存
+                        if (this.changeCounter[file.path] >= this.settings.autoSaveMinChanges) {
+                            await this.saveVersion(file, '自动保存 (变更触发)');
+                            this.changeCounter[file.path] = 0;
+                            return; // 已保存，不需要再设置定时器
+                        }
+                    }
+                    
+                    // 设置定时自动保存
+                    this.scheduleAutoSave(file);
+                    this.updateSidebar();
+                }
+            })
+        );
+
+        this.registerEvent(
+            this.app.vault.on('delete', (file) => {
+                if (file instanceof TFile && this.settings.enableBackup) {
+                    this.backupBeforeDelete(file);
+                }
+                // 清理该文件的定时器
+                if (this.fileWatchers.has(file.path)) {
+                    window.clearTimeout(this.fileWatchers.get(file.path));
+                    this.fileWatchers.delete(file.path);
+                }
+            })
+        );
+
+        this.registerEvent(
+            this.app.vault.on('rename', (file, oldPath) => {
+                if (file instanceof TFile) {
+                    this.handleFileRename(file, oldPath);
+                    // 迁移定时器
+                    if (this.fileWatchers.has(oldPath)) {
+                        const timer = this.fileWatchers.get(oldPath);
+                        this.fileWatchers.set(file.path, timer);
+                        this.fileWatchers.delete(oldPath);
+                    }
+                }
+            })
+        );
+    }
+
+    showQuickMenu(evt) {
+        const menu = new Menu();
+        const activeFile = this.app.workspace.getActiveFile();
+
+        if (activeFile) {
+            menu.addItem((item) => {
+                item.setTitle('快速保存版本').setIcon('save').onClick(() => this.quickSaveVersion());
+            });
+            menu.addItem((item) => {
+                item.setTitle('查看版本历史').setIcon('history').onClick(() => this.showVersionListModal());
+            });
+            menu.addItem((item) => {
+                item.setTitle('比较版本').setIcon('diff').onClick(() => this.showCompareModal());
+            });
+            menu.addItem((item) => {
+                item.setTitle('创建快照').setIcon('bookmark').onClick(() => this.showSnapshotModal());
+            });
+            menu.addSeparator();
+        }
+
+        menu.addItem((item) => {
+            item.setTitle('版本统计').setIcon('chart-line').onClick(() => new StatsModal(this.app, this).open());
+        });
+        menu.addItem((item) => {
+            item.setTitle('搜索版本').setIcon('search').onClick(() => new SearchVersionModal(this.app, this).open());
+        });
+        menu.addItem((item) => {
+            item.setTitle('版本时间线').setIcon('clock').onClick(() => new TimelineModal(this.app, this).open());
+        });
+        menu.addItem((item) => {
+            item.setTitle('清理旧版本').setIcon('trash').onClick(() => new CleanupModal(this.app, this).open());
+        });
+
+        menu.showAtMouseEvent(evt);
+    }
+
+    addFileContextMenu(menu, file) {
+        menu.addSeparator();
+        menu.addItem((item) => {
+            item.setTitle('保存版本').setIcon('archive').onClick(() => {
+                new SaveVersionModal(this.app, this, file).open();
+            });
+        });
+        menu.addItem((item) => {
+            item.setTitle('查看版本历史').setIcon('history').onClick(() => {
+                new VersionListModal(this.app, this, file).open();
+            });
+        });
+        menu.addItem((item) => {
+            item.setTitle('比较版本').setIcon('diff').onClick(() => {
+                new CompareVersionModal(this.app, this, file).open();
+            });
+        });
+    }
+
+    addEditorContextMenu(menu, editor, view) {
+        menu.addSeparator();
+        menu.addItem((item) => {
+            item.setTitle('保存当前版本').setIcon('save').onClick(() => {
+                if (view.file) {
+                    this.saveVersion(view.file, '手动保存');
+                }
+            });
+        });
+        menu.addItem((item) => {
+            item.setTitle('查看变更预览').setIcon('eye').onClick(() => {
+                if (view.file) {
+                    this.showChangePreview(view.file);
+                }
+            });
+        });
+    }
+
+    async showChangePreview(file) {
+        const versions = this.getVersions(file);
+        if (versions.length === 0) {
+            new Notice('没有可比较的版本');
+            return;
+        }
+
+        const currentContent = await this.app.vault.read(file);
+        const lastVersion = versions[versions.length - 1];
+        
+        const diff = new DiffEngine(lastVersion.content, currentContent);
+        const changes = diff.compute();
+        
+        new ChangePreviewModal(this.app, changes).open();
+    }
+
+    async saveVersion(file, comment, isSnapshot = false) {
+        try {
+            const content = await this.app.vault.read(file);
+            const hash = this.generateHash(content);
+            
+            if (!this.versionData[file.path]) {
+                this.versionData[file.path] = [];
+            }
+
+            const versions = this.versionData[file.path];
+            
+            if (versions.length > 0 && !isSnapshot) {
+                const lastVersion = versions[versions.length - 1];
+                if (lastVersion.hash === hash) {
+                    if (this.settings.showNotifications) {
+                        new Notice('内容未变更,无需保存新版本');
+                    }
+                    return false;
+                }
+            }
+
+            const version = {
+                timestamp: Date.now(),
+                content: content,
+                hash: hash,
+                comment: comment || '',
+                size: content.length,
+                isSnapshot: isSnapshot,
+                tags: [],
+                author: 'default',
+                compressed: false,
+                metadata: {
+                    lineCount: content.split('\n').length,
+                    wordCount: content.split(/\s+/).length,
+                    changeType: this.detectChangeType(versions, content),
+                    charactersAdded: versions.length > 0 ? Math.max(0, content.length - versions[versions.length - 1].content.length) : content.length,
+                    charactersRemoved: versions.length > 0 ? Math.max(0, versions[versions.length - 1].content.length - content.length) : 0
+                }
+            };
+
+            versions.push(version);
+            this.changeLog.push({
+                file: file.path,
+                action: 'save',
+                timestamp: Date.now(),
+                versionIndex: versions.length - 1
+            });
+
+            if (!isSnapshot && versions.length > this.settings.maxVersions) {
+                const nonSnapshots = versions.filter(v => !v.isSnapshot);
+                if (nonSnapshots.length > this.settings.maxVersions) {
+                    const toRemove = nonSnapshots[0];
+                    const index = versions.indexOf(toRemove);
+                    if (index > -1) {
+                        versions.splice(index, 1);
+                    }
+                }
+            }
+
+            await this.saveVersionData();
+            this.modifiedFiles.delete(file.path);
+            this.lastSaveTime[file.path] = Date.now();
+            this.changeCounter[file.path] = 0;
+            this.updateStatusBar();
+            this.updateSidebar();
+            
+            if (this.settings.showNotifications) {
+                new Notice(`已保存版本 (${versions.length}/${this.settings.maxVersions})`);
+            }
+            
+            return true;
+        } catch (error) {
+            console.error('保存版本失败:', error);
+            new Notice('保存版本失败: ' + error.message);
+            return false;
+        }
+    }
+
+    detectChangeType(versions, content) {
+        if (versions.length === 0) return 'initial';
+        
+        const lastContent = versions[versions.length - 1].content;
+        const sizeDiff = content.length - lastContent.length;
+        
+        if (sizeDiff > 0) return 'added';
+        if (sizeDiff < 0) return 'removed';
+        return 'modified';
+    }
+
+    async restoreVersion(file, versionIndex) {
+        const versions = this.versionData[file.path];
+        if (!versions || !versions[versionIndex]) {
+            new Notice('版本不存在');
+            return;
+        }
+
+        const version = versions[versionIndex];
+        await this.saveVersion(file, `恢复前备份: ${new Date().toLocaleString('zh-CN')}`);
+        await this.app.vault.modify(file, version.content);
+        new Notice('版本已恢复');
+        this.updateSidebar();
+    }
+
+    async deleteVersion(file, versionIndex) {
+        const versions = this.versionData[file.path];
+        if (!versions || !versions[versionIndex]) {
+            new Notice('版本不存在');
+            return;
+        }
+
+        versions.splice(versionIndex, 1);
+        await this.saveVersionData();
+        new Notice('版本已删除');
+        this.updateSidebar();
+    }
+
+    getVersions(file) {
+        return this.versionData[file.path] || [];
+    }
+
+    getAllVersions() {
+        return this.versionData;
+    }
+
+    getVersionCount() {
+        let count = 0;
+        for (const filePath in this.versionData) {
+            count += this.versionData[filePath].length;
+        }
+        return count;
+    }
+
+    getTotalSize() {
+        let size = 0;
+        for (const filePath in this.versionData) {
+            this.versionData[filePath].forEach(v => {
+                size += v.size || 0;
+            });
+        }
+        return size;
+    }
+
+    generateHash(content) {
+        let hash = 0;
+        for (let i = 0; i < content.length; i++) {
+            const char = content.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;
+        }
+        return hash.toString(36);
+    }
+
+    scheduleAutoSave(file) {
+        const fileKey = file.path;
+        
+        // 清除该文件之前的定时器
+        if (this.fileWatchers.has(fileKey)) {
+            window.clearTimeout(this.fileWatchers.get(fileKey));
+        }
+
+        // 设置新的定时器
+        const timer = window.setTimeout(async () => {
+            if (this.modifiedFiles.has(fileKey)) {
+                await this.saveVersion(file, '自动保存 (定时触发)');
+            }
+        }, this.settings.autoSaveInterval * 60 * 1000);
+        
+        this.fileWatchers.set(fileKey, timer);
+    }
+
+    startAutoSave() {
+        // Auto-save is triggered by file modification events
+    }
+
+    scheduleAutoCleanup() {
+        this.registerInterval(
+            window.setInterval(() => {
+                this.cleanupOldVersions(this.settings.autoCleanupDays);
+            }, 24 * 60 * 60 * 1000)
+        );
+    }
+
+    scheduleAutoSnapshot() {
+        this.registerInterval(
+            window.setInterval(async () => {
+                const activeFile = this.app.workspace.getActiveFile();
+                if (activeFile) {
+                    await this.saveVersion(activeFile, '自动快照', true);
+                }
+            }, this.settings.autoSnapshotInterval * 60 * 1000)
+        );
+    }
+
+    updateStatusBar() {
+        if (this.statusBarItem) {
+            if (!this.settings.showStatusBar) {
+                this.statusBarItem.setText('');
+                this.statusBarItem.style.display = 'none';
+                return;
+            }
+            
+            this.statusBarItem.style.display = '';
+            const count = this.getVersionCount();
+            const size = this.formatSize(this.getTotalSize());
+            const modified = this.modifiedFiles.size;
+            let text = `📦 ${count}个版本 | ${size}`;
+            if (modified > 0) text += ` | ⚠️ ${modified}个待保存`;
+            this.statusBarItem.setText(text);
+        }
+    }
+
+    async batchSaveOpenFiles() {
+        const leaves = this.app.workspace.getLeavesOfType('markdown');
+        let saved = 0;
+        
+        for (const leaf of leaves) {
+            const view = leaf.view;
+            if (view instanceof MarkdownView && view.file) {
+                const success = await this.saveVersion(view.file, '批量保存');
+                if (success) saved++;
+            }
+        }
+        
+        new Notice(`已保存 ${saved} 个文件的版本`);
+    }
+
+    async backupBeforeDelete(file) {
+        await this.saveVersion(file, '删除前备份', true);
+    }
+
+    async handleFileRename(file, oldPath) {
+        if (this.versionData[oldPath]) {
+            this.versionData[file.path] = this.versionData[oldPath];
+            delete this.versionData[oldPath];
+            
+            if (this.versionNames[oldPath]) {
+                this.versionNames[file.path] = this.versionNames[oldPath];
+                delete this.versionNames[oldPath];
+            }
+            
+            if (this.versionTags[oldPath]) {
+                this.versionTags[file.path] = this.versionTags[oldPath];
+                delete this.versionTags[oldPath];
+            }
+            
+            // 迁移状态
+            if (this.lastSaveTime[oldPath]) {
+                this.lastSaveTime[file.path] = this.lastSaveTime[oldPath];
+                delete this.lastSaveTime[oldPath];
+            }
+            
+            if (this.changeCounter[oldPath]) {
+                this.changeCounter[file.path] = this.changeCounter[oldPath];
+                delete this.changeCounter[oldPath];
+            }
+            
+            await this.saveVersionData();
+        }
+    }
+
+    async cleanupOldVersions(daysOld) {
+        const cutoffTime = Date.now() - (daysOld * 24 * 60 * 60 * 1000);
+        let removed = 0;
+
+        for (const filePath in this.versionData) {
+            const versions = this.versionData[filePath];
+            const filtered = versions.filter(v => 
+                v.isSnapshot || v.timestamp >= cutoffTime
+            );
+            removed += versions.length - filtered.length;
+            this.versionData[filePath] = filtered;
+        }
+
+        if (removed > 0) {
+            await this.saveVersionData();
+        }
+        return removed;
+    }
+
+    searchInVersions(query) {
+        const results = [];
+        const maxResults = this.settings.maxSearchResults;
+        
+        for (const filePath in this.versionData) {
+            if (results.length >= maxResults) break;
+            
+            this.versionData[filePath].forEach((version, index) => {
+                if (results.length >= maxResults) return;
+                
+                if (version.content.toLowerCase().includes(query.toLowerCase()) || 
+                    (version.comment && version.comment.toLowerCase().includes(query.toLowerCase()))) {
+                    results.push({
+                        filePath,
+                        versionIndex: index,
+                        version,
+                        excerpt: this.getExcerpt(version.content, query)
+                    });
+                }
+            });
+        }
+        
+        return results;
+    }
+
+    getExcerpt(content, query, length = 100) {
+        const index = content.toLowerCase().indexOf(query.toLowerCase());
+        if (index === -1) return content.substring(0, length) + '...';
+        
+        const start = Math.max(0, index - 50);
+        const end = Math.min(content.length, index + query.length + 50);
+        return '...' + content.substring(start, end) + '...';
+    }
+
+    getVersionName(filePath, versionIndex) {
+        if (!this.versionNames[filePath]) return null;
+        return this.versionNames[filePath][versionIndex] || null;
+    }
+
+    setVersionName(filePath, versionIndex, name) {
+        if (!this.versionNames[filePath]) {
+            this.versionNames[filePath] = {};
+        }
+        this.versionNames[filePath][versionIndex] = name;
+        this.saveVersionData();
+    }
+
+    getVersionTags(filePath, versionIndex) {
+        if (!this.versionTags[filePath]) return [];
+        return this.versionTags[filePath][versionIndex] || [];
+    }
+
+    addVersionTag(filePath, versionIndex, tag) {
+        if (!this.versionTags[filePath]) {
+            this.versionTags[filePath] = {};
+        }
+        if (!this.versionTags[filePath][versionIndex]) {
+            this.versionTags[filePath][versionIndex] = [];
+        }
+        if (!this.versionTags[filePath][versionIndex].includes(tag)) {
+            this.versionTags[filePath][versionIndex].push(tag);
+            this.saveVersionData();
+        }
+    }
+
+    formatSize(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+
+    async loadVersionData() {
+        const data = await this.loadData();
+        this.versionData = (data && data.versionData) ? data.versionData : {};
+        this.versionNames = (data && data.versionNames) ? data.versionNames : {};
+        this.versionTags = (data && data.versionTags) ? data.versionTags : {};
+    }
+
+    async saveVersionData() {
+        await this.saveData({ 
+            ...this.settings, 
+            versionData: this.versionData,
+            changeLog: this.changeLog,
+            versionNames: this.versionNames,
+            versionTags: this.versionTags
+        });
+    }
+
+    onunload() {
+        // 清理所有文件的自动保存定时器
+        this.fileWatchers.forEach((timer) => {
+            window.clearTimeout(timer);
+        });
+        this.fileWatchers.clear();
+        
+        if (this.autoSaveTimer) {
+            window.clearTimeout(this.autoSaveTimer);
+        }
+    }
+}
+
+// 侧边栏视图类
+class VersionControlSidebarView extends ItemView {
+    constructor(leaf, plugin) {
+        super(leaf);
+        this.plugin = plugin;
+        this.activeFile = null;
+    }
+
+    getViewType() {
+        return SIDEBAR_VIEW_TYPE;
+    }
+
+    getDisplayText() {
+        return '版本控制';
+    }
+
+    getIcon() {
+        return 'archive';
+    }
+
+    async onOpen() {
+        this.render();
+    }
+
+    refresh() {
+        this.render();
+    }
+
+    async render() {
+        const { containerEl } = this;
+        containerEl.empty();
+
+        const activeFile = this.plugin.app.workspace.getActiveFile();
+        
+        if (!activeFile) {
+            containerEl.createEl('div', { cls: 'sidebar-placeholder', text: '请打开一个文件' });
+            return;
+        }
+
+        this.activeFile = activeFile;
+
+        // 创建头部
+        this.createHeader(containerEl, activeFile);
+
+        // 创建自动保存状态指示器
+        this.createAutoSaveIndicator(containerEl, activeFile);
+
+        // 创建快速操作按钮
+        this.createQuickActions(containerEl, activeFile);
+
+        // 创建搜索和筛选
+        this.createFilterSection(containerEl, activeFile);
+
+        // 创建版本列表
+        this.createVersionList(containerEl, activeFile);
+
+        // 创建统计信息
+        this.createStats(containerEl, activeFile);
+
+        this.addStyles();
+    }
+
+    createAutoSaveIndicator(container, file) {
+        const indicator = container.createEl('div', { cls: 'auto-save-indicator' });
+        
+        const status = indicator.createEl('div', { cls: 'indicator-status' });
+        
+        if (this.plugin.settings.enableAutoSave) {
+            const lastSave = this.plugin.lastSaveTime[file.path];
+            const changeCount = this.plugin.changeCounter[file.path] || 0;
+            
+            status.createEl('span', { 
+                cls: 'status-icon active',
+                text: '🟢'
+            });
+            
+            const statusText = status.createEl('span', { cls: 'status-text' });
+            
+            if (lastSave) {
+                const timeSince = Date.now() - lastSave;
+                const minutesAgo = Math.floor(timeSince / 60000);
+                statusText.setText(`自动保存: ${minutesAgo > 0 ? minutesAgo + '分钟前' : '刚刚'}`);
+            } else {
+                statusText.setText('自动保存: 已启用');
+            }
+            
+            if (changeCount > 0) {
+                indicator.createEl('small', { 
+                    cls: 'change-counter',
+                    text: `📝 ${changeCount}/${this.plugin.settings.autoSaveMinChanges} 次变更`
+                });
+            }
+        } else {
+            status.createEl('span', { 
+                cls: 'status-icon inactive',
+                text: '⚪'
+            });
+            status.createEl('span', { 
+                cls: 'status-text',
+                text: '自动保存: 已禁用'
+            });
+        }
+    }
+
+    createFilterSection(container, file) {
+        const filterSection = container.createEl('div', { cls: 'sidebar-filter' });
+        
+        const searchInput = filterSection.createEl('input', {
+            type: 'text',
+            placeholder: '🔍 搜索版本...',
+            cls: 'filter-input'
+        });
+        
+        searchInput.addEventListener('input', (e) => {
+            this.filterQuery = e.target.value;
+            this.createVersionList(container.querySelector('.sidebar-version-list')?.parentElement || container, file);
+        });
+        
+        const filterButtons = filterSection.createEl('div', { cls: 'filter-buttons' });
+        
+        const btnAll = filterButtons.createEl('button', { 
+            text: '全部',
+            cls: 'filter-btn active'
+        });
+        
+        const btnSnapshots = filterButtons.createEl('button', { 
+            text: '快照',
+            cls: 'filter-btn'
+        });
+        
+        const btnRecent = filterButtons.createEl('button', { 
+            text: '最近',
+            cls: 'filter-btn'
+        });
+        
+        btnAll.addEventListener('click', () => {
+            this.filterType = 'all';
+            this.updateFilterButtons(filterButtons);
+            this.createVersionList(container.querySelector('.sidebar-version-list')?.parentElement || container, file);
+        });
+        
+        btnSnapshots.addEventListener('click', () => {
+            this.filterType = 'snapshots';
+            this.updateFilterButtons(filterButtons);
+            this.createVersionList(container.querySelector('.sidebar-version-list')?.parentElement || container, file);
+        });
+        
+        btnRecent.addEventListener('click', () => {
+            this.filterType = 'recent';
+            this.updateFilterButtons(filterButtons);
+            this.createVersionList(container.querySelector('.sidebar-version-list')?.parentElement || container, file);
+        });
+    }
+
+    updateFilterButtons(container) {
+        container.querySelectorAll('.filter-btn').forEach(btn => {
+            btn.removeClass('active');
+        });
+        
+        if (this.filterType === 'all') {
+            container.querySelector('.filter-btn:nth-child(1)')?.addClass('active');
+        } else if (this.filterType === 'snapshots') {
+            container.querySelector('.filter-btn:nth-child(2)')?.addClass('active');
+        } else if (this.filterType === 'recent') {
+            container.querySelector('.filter-btn:nth-child(3)')?.addClass('active');
+        }
+    }
+
+    createHeader(container, file) {
+        const header = container.createEl('div', { cls: 'sidebar-header' });
+        header.createEl('div', { cls: 'sidebar-title', text: '版本历史' });
+        header.createEl('small', { cls: 'sidebar-filename', text: file.name });
+    }
+
+    createQuickActions(container, file) {
+        const actions = container.createEl('div', { cls: 'sidebar-actions' });
+
+        const btnSave = actions.createEl('button', { text: '保存版本', cls: 'sidebar-btn' });
+        btnSave.addEventListener('click', () => {
+            new SaveVersionModal(this.plugin.app, this.plugin, file).open();
+        });
+
+        const btnRestore = actions.createEl('button', { text: '恢复版本', cls: 'sidebar-btn' });
+        btnRestore.addEventListener('click', () => {
+            new VersionListModal(this.plugin.app, this.plugin, file).open();
+        });
+
+        const btnCompare = actions.createEl('button', { text: '比较', cls: 'sidebar-btn' });
+        btnCompare.addEventListener('click', () => {
+            new CompareVersionModal(this.plugin.app, this.plugin, file).open();
+        });
+
+        const btnSnapshot = actions.createEl('button', { text: '快照', cls: 'sidebar-btn' });
+        btnSnapshot.addEventListener('click', () => {
+            new SnapshotModal(this.plugin.app, this.plugin, file).open();
+        });
+    }
+
+    createVersionList(container, file) {
+        // 移除旧的版本列表
+        const oldList = container.querySelector('.sidebar-version-list');
+        if (oldList) oldList.remove();
+        
+        let versions = this.plugin.getVersions(file);
+
+        if (versions.length === 0) {
+            container.createEl('div', { cls: 'sidebar-empty', text: '暂无版本' });
+            return;
+        }
+
+        // 应用筛选
+        if (this.filterType === 'snapshots') {
+            versions = versions.filter(v => v.isSnapshot);
+        } else if (this.filterType === 'recent') {
+            const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+            versions = versions.filter(v => v.timestamp > oneDayAgo);
+        }
+        
+        // 应用搜索
+        if (this.filterQuery) {
+            versions = versions.filter(v => 
+                (v.comment && v.comment.toLowerCase().includes(this.filterQuery.toLowerCase())) ||
+                new Date(v.timestamp).toLocaleString('zh-CN').includes(this.filterQuery)
+            );
+        }
+
+        const listContainer = container.createEl('div', { cls: 'sidebar-version-list' });
+        listContainer.createEl('div', { 
+            cls: 'sidebar-section-title', 
+            text: `版本列表 (${versions.length}/${this.plugin.getVersions(file).length})` 
+        });
+
+        const list = listContainer.createEl('div', { cls: 'version-items' });
+
+        // 显示版本数量根据设置
+        const maxShow = this.plugin.settings.sidebarCompactMode ? 5 : this.plugin.settings.sidebarMaxVersions;
+        const displayVersions = versions.slice(-maxShow).reverse();
+
+        displayVersions.forEach((version, idx) => {
+            const allVersions = this.plugin.getVersions(file);
+            const actualIndex = allVersions.indexOf(version);
+            const item = list.createEl('div', { cls: 'sidebar-version-item' });
+            
+            if (this.plugin.settings.sidebarCompactMode) {
+                item.addClass('compact');
+            }
+            
+            const badge = version.isSnapshot ? '📌' : '📄';
+            const date = new Date(version.timestamp);
+            const timeStr = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+            const dateStr = date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
+
+            const headerRow = item.createEl('div', { cls: 'item-header-row' });
+            headerRow.createEl('div', { cls: 'item-header', text: `${badge} v${actualIndex + 1}` });
+            headerRow.createEl('small', { cls: 'item-time', text: `${dateStr} ${timeStr}` });
+
+            if (version.comment && !this.plugin.settings.sidebarCompactMode) {
+                item.createEl('small', { cls: 'item-comment', text: version.comment });
+            }
+
+            // 显示版本名称
+            const versionName = this.plugin.getVersionName(file.path, actualIndex);
+            if (versionName) {
+                item.createEl('small', { cls: 'item-name', text: `🏷️ ${versionName}` });
+            }
+
+            // 显示标签
+            const tags = this.plugin.getVersionTags(file.path, actualIndex);
+            if (tags.length > 0 && !this.plugin.settings.sidebarCompactMode) {
+                const tagContainer = item.createEl('div', { cls: 'item-tags' });
+                tags.slice(0, 3).forEach(tag => {
+                    tagContainer.createEl('span', { cls: 'tag-badge', text: tag });
+                });
+                if (tags.length > 3) {
+                    tagContainer.createEl('span', { cls: 'tag-badge more', text: `+${tags.length - 3}` });
+                }
+            }
+
+            // 显示预览
+            if (this.plugin.settings.sidebarShowPreview && !this.plugin.settings.sidebarCompactMode) {
+                const preview = version.content.substring(0, 60).replace(/\n/g, ' ');
+                item.createEl('small', { cls: 'item-preview', text: preview + '...' });
+            }
+
+            const metaRow = item.createEl('div', { cls: 'item-meta-row' });
+            metaRow.createEl('small', { cls: 'item-size', text: this.plugin.formatSize(version.size) });
+            
+            if (version.metadata && !this.plugin.settings.sidebarCompactMode) {
+                const changeIcons = {
+                    'initial': '🆕',
+                    'added': '➕',
+                    'removed': '➖',
+                    'modified': '✏️'
+                };
+                const changeIcon = changeIcons[version.metadata.changeType] || '📝';
+                metaRow.createEl('small', { 
+                    cls: 'item-change-type', 
+                    text: `${changeIcon} ${version.metadata.lineCount}行`
+                });
+            }
+
+            const itemActions = item.createEl('div', { cls: 'item-actions' });
+
+            const restoreBtn = itemActions.createEl('button', { text: '还原', cls: 'action-btn' });
+            restoreBtn.addEventListener('click', async () => {
+                await this.plugin.restoreVersion(file, actualIndex);
+                this.refresh();
+            });
+
+            const viewBtn = itemActions.createEl('button', { text: '查看', cls: 'action-btn' });
+            viewBtn.addEventListener('click', () => {
+                new ViewVersionModal(this.plugin.app, version).open();
+            });
+            
+            if (!this.plugin.settings.sidebarCompactMode) {
+                const compareBtn = itemActions.createEl('button', { text: '对比', cls: 'action-btn' });
+                compareBtn.addEventListener('click', () => {
+                    new CompareVersionModal(this.plugin.app, this.plugin, file).open();
+                });
+            }
+        });
+        
+        // 如果有更多版本,显示提示
+        if (versions.length > maxShow) {
+            const moreHint = listContainer.createEl('div', { 
+                cls: 'more-versions-hint',
+                text: `还有 ${versions.length - maxShow} 个版本...`
+            });
+            moreHint.addEventListener('click', () => {
+                new VersionListModal(this.plugin.app, this.plugin, file).open();
+            });
+        }
+    }
+
+    createStats(container, file) {
+        const versions = this.plugin.getVersions(file);
+        if (versions.length === 0) return;
+
+        const stats = container.createEl('div', { cls: 'sidebar-stats' });
+        stats.createEl('div', { cls: 'sidebar-section-title', text: '统计信息' });
+
+        let totalSize = 0;
+        let snapshotCount = 0;
+        let maxVersion = null;
+
+        versions.forEach(v => {
+            totalSize += v.size || 0;
+            if (v.isSnapshot) snapshotCount++;
+            if (!maxVersion || v.size > maxVersion.size) maxVersion = v;
+        });
+
+        const statsGrid = stats.createEl('div', { cls: 'stats-grid' });
+
+        this.createStatItem(statsGrid, '总版本数', versions.length.toString());
+        this.createStatItem(statsGrid, '快照数', snapshotCount.toString());
+        this.createStatItem(statsGrid, '总大小', this.plugin.formatSize(totalSize));
+        this.createStatItem(statsGrid, '最大版本', this.plugin.formatSize(maxVersion?.size || 0));
+    }
+
+    createStatItem(container, label, value) {
+        const item = container.createEl('div', { cls: 'stat-box' });
+        item.createEl('div', { cls: 'stat-label', text: label });
+        item.createEl('div', { cls: 'stat-value', text: value });
+    }
+
+    addStyles() {
+        const style = this.containerEl.createEl('style');
+        style.textContent = `
+            .sidebar-placeholder {
+                padding: 1.5em;
+                text-align: center;
+                color: var(--text-muted);
+            }
+
+            .sidebar-header {
+                padding: 1em;
+                border-bottom: 1px solid var(--background-modifier-border);
+            }
+
+            .sidebar-title {
+                font-weight: bold;
+                font-size: 1em;
+                margin-bottom: 0.3em;
+            }
+
+            .sidebar-filename {
+                color: var(--text-muted);
+                font-size: 0.85em;
+                word-break: break-all;
+            }
+
+            .sidebar-actions {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 0.5em;
+                padding: 0.8em;
+                border-bottom: 1px solid var(--background-modifier-border);
+            }
+
+            .sidebar-btn {
+                padding: 0.6em;
+                font-size: 0.85em;
+                border: 1px solid var(--background-modifier-border);
+                border-radius: 4px;
+                background: var(--background-primary);
+                cursor: pointer;
+                transition: all 0.2s ease;
+                min-height: 36px;
+            }
+
+            .sidebar-btn:hover {
+                background: var(--background-secondary);
+            }
+
+            .sidebar-btn:active {
+                transform: scale(0.95);
+            }
+
+            .sidebar-version-list {
+                padding: 0.8em;
+                border-bottom: 1px solid var(--background-modifier-border);
+            }
+
+            .sidebar-section-title {
+                font-weight: bold;
+                font-size: 0.9em;
+                margin-bottom: 0.8em;
+                color: var(--text-normal);
+            }
+
+            .version-items {
+                display: flex;
+                flex-direction: column;
+                gap: 0.5em;
+                max-height: 300px;
+                overflow-y: auto;
+            }
+
+            .sidebar-version-item {
+                padding: 0.8em;
+                border: 1px solid var(--background-modifier-border);
+                border-radius: 4px;
+                background: var(--background-primary);
+                transition: all 0.2s ease;
+            }
+
+            .sidebar-version-item:hover {
+                background: var(--background-secondary);
+                border-color: var(--interactive-accent);
+            }
+
+            .item-header {
+                font-weight: bold;
+                font-size: 0.9em;
+                margin-bottom: 0.3em;
+            }
+
+            .item-time,
+            .item-comment,
+            .item-name,
+            .item-size {
+                display: block;
+                color: var(--text-muted);
+                font-size: 0.8em;
+                margin-bottom: 0.2em;
+            }
+
+            .item-comment {
+                color: var(--text-accent);
+                font-style: italic;
+                margin-top: 0.3em;
+            }
+
+            .item-name {
+                color: var(--text-success);
+            }
+
+            .item-tags {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.3em;
+                margin: 0.3em 0;
+            }
+
+            .tag-badge {
+                font-size: 0.7em;
+                padding: 0.2em 0.5em;
+                background: var(--interactive-accent);
+                color: var(--text-on-accent);
+                border-radius: 3px;
+            }
+
+            .item-actions {
+                display: flex;
+                gap: 0.3em;
+                margin-top: 0.5em;
+            }
+
+            .action-btn {
+                flex: 1;
+                padding: 0.4em;
+                font-size: 0.75em;
+                border: 1px solid var(--interactive-accent);
+                border-radius: 3px;
+                background: transparent;
+                color: var(--interactive-accent);
+                cursor: pointer;
+                transition: all 0.2s ease;
+                min-height: 28px;
+            }
+
+            .action-btn:hover {
+                background: var(--interactive-accent);
+                color: var(--text-on-accent);
+            }
+
+            .action-btn:active {
+                transform: scale(0.95);
+            }
+
+            .sidebar-stats {
+                padding: 0.8em;
+            }
+
+            .stats-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 0.6em;
+            }
+
+            .stat-box {
+                padding: 0.8em;
+                background: var(--background-secondary);
+                border-radius: 4px;
+                border: 1px solid var(--background-modifier-border);
+                text-align: center;
+            }
+
+            .stat-label {
+                font-size: 0.8em;
+                color: var(--text-muted);
+                margin-bottom: 0.3em;
+            }
+
+            .stat-value {
+                font-size: 0.95em;
+                font-weight: bold;
+                color: var(--text-accent);
+            }
+
+            .sidebar-empty {
+                padding: 1.5em;
+                text-align: center;
+                color: var(--text-muted);
+                font-size: 0.9em;
+            }
+        `;
+    }
+
+    onClose() {
+        const { containerEl } = this;
+        containerEl.empty();
+    }
+}
+
+// Modal Classes
+class SaveVersionModal extends Modal {
+    constructor(app, plugin, file) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+        this.comment = '';
+        this.tags = [];
+        this.versionName = '';
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '保存版本' });
+        contentEl.createEl('p', { text: `文件: ${this.file.name}` });
+
+        new Setting(contentEl)
+            .setName('版本备注')
+            .setDesc('为此版本添加说明')
+            .addText(text => text
+                .setPlaceholder('例如:修复了格式问题')
+                .onChange(value => { this.comment = value; }));
+
+        if (this.plugin.settings.enableVersionNaming) {
+            new Setting(contentEl)
+                .setName('版本名称')
+                .setDesc('为版本设置一个易记的名称')
+                .addText(text => text
+                    .setPlaceholder('例如:稳定版 1.0')
+                    .onChange(value => { this.versionName = value; }));
+        }
+
+        if (this.plugin.settings.enableTags) {
+            new Setting(contentEl)
+                .setName('标签')
+                .setDesc('添加标签(用逗号分隔)')
+                .addText(text => text
+                    .setPlaceholder('例如:重要, 修复, 功能')
+                    .onChange(value => {
+                        this.tags = value.split(',').map(t => t.trim()).filter(t => t);
+                    }));
+        }
+
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('保存').setCta().onClick(async () => {
+                const success = await this.plugin.saveVersion(this.file, this.comment);
+                if (success && this.versionName) {
+                    const versions = this.plugin.getVersions(this.file);
+                    this.plugin.setVersionName(this.file.path, versions.length - 1, this.versionName);
+                }
+                if (success && this.tags.length > 0) {
+                    const versions = this.plugin.getVersions(this.file);
+                    this.tags.forEach(tag => {
+                        this.plugin.addVersionTag(this.file.path, versions.length - 1, tag);
+                    });
+                }
+                this.close();
+            }))
+            .addButton(btn => btn.setButtonText('保存为快照').onClick(async () => {
+                const success = await this.plugin.saveVersion(this.file, this.comment, true);
+                if (success && this.versionName) {
+                    const versions = this.plugin.getVersions(this.file);
+                    this.plugin.setVersionName(this.file.path, versions.length - 1, this.versionName);
+                }
+                this.close();
+            }))
+            .addButton(btn => btn.setButtonText('取消').onClick(() => this.close()));
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class VersionListModal extends Modal {
+    constructor(app, plugin, file) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+        this.filterText = '';
+        this.sortBy = 'date';
+        this.filterTag = '';
+    }
+
+    onOpen() {
+        this.render();
+    }
+
+    render() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '版本历史' });
+        contentEl.createEl('p', { text: `文件: ${this.file.name}` });
+
+        const toolbar = contentEl.createEl('div', { cls: 'version-toolbar' });
+        
+        new Setting(toolbar)
+            .setName('搜索')
+            .addText(text => text
+                .setPlaceholder('搜索备注...')
+                .onChange(value => {
+                    this.filterText = value;
+                    this.renderVersions();
+                }));
+
+        new Setting(toolbar)
+            .setName('筛选标签')
+            .addText(text => text
+                .setPlaceholder('输入标签...')
+                .onChange(value => {
+                    this.filterTag = value;
+                    this.renderVersions();
+                }));
+
+        new Setting(toolbar)
+            .setName('排序')
+            .addDropdown(dropdown => dropdown
+                .addOption('date', '按日期')
+                .addOption('size', '按大小')
+                .addOption('comment', '按备注')
+                .setValue(this.sortBy)
+                .onChange(value => {
+                    this.sortBy = value;
+                    this.renderVersions();
+                }));
+
+        this.versionContainer = contentEl.createEl('div', { cls: 'version-container' });
+        this.renderVersions();
+    }
+
+    renderVersions() {
+        this.versionContainer.empty();
+
+        let versions = this.plugin.getVersions(this.file);
+
+        if (versions.length === 0) {
+            this.versionContainer.createEl('p', { text: '暂无版本历史' });
+            return;
+        }
+
+        if (this.filterText) {
+            versions = versions.filter(v => 
+                (v.comment && v.comment.toLowerCase().includes(this.filterText.toLowerCase()))
+            );
+        }
+
+        if (this.filterTag) {
+            versions = versions.filter((v, idx) => {
+                const tags = this.plugin.getVersionTags(this.file.path, idx);
+                return tags.some(tag => tag.toLowerCase().includes(this.filterTag.toLowerCase()));
+            });
+        }
+
+        versions = [...versions];
+        if (this.sortBy === 'date') {
+            versions.sort((a, b) => b.timestamp - a.timestamp);
+        } else if (this.sortBy === 'size') {
+            versions.sort((a, b) => (b.size || 0) - (a.size || 0));
+        } else if (this.sortBy === 'comment') {
+            versions.sort((a, b) => (a.comment || '').localeCompare(b.comment || ''));
+        }
+
+        const listEl = this.versionContainer.createEl('div', { cls: 'version-list' });
+
+        versions.forEach((version) => {
+            const actualIndex = this.plugin.getVersions(this.file).indexOf(version);
+            this.renderVersionItem(listEl, version, actualIndex);
+        });
+    }
+
+    renderVersionItem(container, version, actualIndex) {
+        const versionEl = container.createEl('div', { cls: 'version-item' });
+        
+        if (version.isSnapshot) {
+            versionEl.addClass('version-snapshot');
+        }
+
+        const date = new Date(version.timestamp);
+        const dateStr = date.toLocaleString('zh-CN');
+        const sizeStr = this.plugin.formatSize(version.size || 0);
+        
+        const headerEl = versionEl.createEl('div', { cls: 'version-header' });
+        headerEl.createEl('span', { 
+            text: `${version.isSnapshot ? '📌 ' : ''}版本 ${actualIndex + 1}`,
+            cls: 'version-title'
+        });
+        headerEl.createEl('span', { 
+            text: dateStr,
+            cls: 'version-date'
+        });
+        headerEl.createEl('span', { 
+            text: sizeStr,
+            cls: 'version-size'
+        });
+
+        const versionName = this.plugin.getVersionName(this.file.path, actualIndex);
+        if (versionName) {
+            versionEl.createEl('div', { 
+                text: `🏷️ ${versionName}`,
+                cls: 'version-name'
+            });
+        }
+        
+        if (version.comment) {
+            versionEl.createEl('div', { 
+                text: `💬 ${version.comment}`,
+                cls: 'version-comment'
+            });
+        }
+
+        const tags = this.plugin.getVersionTags(this.file.path, actualIndex);
+        if (tags.length > 0) {
+            const tagContainer = versionEl.createEl('div', { cls: 'version-tags' });
+            tags.forEach(tag => {
+                tagContainer.createEl('span', { cls: 'tag-badge', text: tag });
+            });
+        }
+
+        if (version.metadata) {
+            const metaEl = versionEl.createEl('div', { cls: 'version-metadata' });
+            metaEl.createEl('small', { 
+                text: `📝 ${version.metadata.lineCount} 行 | 📊 ${version.metadata.wordCount} 词`,
+                cls: 'metadata-info'
+            });
+            if (version.metadata.changeType) {
+                const changeTypes = {
+                    'initial': '🆕 初始版本',
+                    'added': '➕ 新增内容',
+                    'removed': '➖ 删除内容',
+                    'modified': '✏️ 修改内容'
+                };
+                metaEl.createEl('small', { 
+                    text: changeTypes[version.metadata.changeType],
+                    cls: 'change-type'
+                });
+            }
+        }
+
+        const btnContainer = versionEl.createEl('div', { cls: 'version-buttons' });
+        
+        btnContainer.createEl('button', { text: '📄 恢复' }).addEventListener('click', () => {
+            this.plugin.restoreVersion(this.file, actualIndex);
+            this.close();
+        });
+
+        btnContainer.createEl('button', { text: '👁️ 查看' }).addEventListener('click', () => {
+            new ViewVersionModal(this.plugin.app, version).open();
+        });
+
+        btnContainer.createEl('button', { text: '🗑️ 删除', cls: 'mod-warning' }).addEventListener('click', () => {
+            if (confirm('确定要删除这个版本吗?')) {
+                this.plugin.deleteVersion(this.file, actualIndex);
+                this.render();
+            }
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class ViewVersionModal extends Modal {
+    constructor(app, version) {
+        super(app);
+        this.version = version;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        const date = new Date(this.version.timestamp);
+        contentEl.createEl('h2', { text: `版本内容 - ${date.toLocaleString('zh-CN')}` });
+
+        const preEl = contentEl.createEl('pre', { cls: 'version-content' });
+        preEl.textContent = this.version.content;
+
+        contentEl.createEl('button', { text: '📋 复制内容' }).addEventListener('click', () => {
+            navigator.clipboard.writeText(this.version.content);
+            new Notice('已复制到剪贴板');
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+// Diff算法引擎
+class DiffEngine {
+    constructor(content1, content2, ignoreWhitespace = false) {
+        if (ignoreWhitespace) {
+            this.lines1 = content1.split('\n').map(line => line.trim());
+            this.lines2 = content2.split('\n').map(line => line.trim());
+        } else {
+            this.lines1 = content1.split('\n');
+            this.lines2 = content2.split('\n');
+        }
+        this.ignoreWhitespace = ignoreWhitespace;
+    }
+
+    compute() {
+        const changes = [];
+        let i = 0, j = 0;
+        
+        while (i < this.lines1.length || j < this.lines2.length) {
+            if (i < this.lines1.length && j < this.lines2.length && this.lines1[i] === this.lines2[j]) {
+                changes.push({ type: 'context', content: this.lines1[i], line1: i + 1, line2: j + 1 });
+                i++;
+                j++;
+            } else if (j >= this.lines2.length || (i < this.lines1.length && this.shouldRemove(i, j))) {
+                changes.push({ type: 'remove', content: this.lines1[i], line1: i + 1 });
+                i++;
+            } else {
+                changes.push({ type: 'add', content: this.lines2[j], line2: j + 1 });
+                j++;
+            }
+        }
+        
+        return changes;
+    }
+
+    shouldRemove(i, j) {
+        return i < this.lines1.length && 
+               (j >= this.lines2.length || this.lines1[i] !== this.lines2[j]);
+    }
+}
+
+// 增强的比较版本Modal
+class CompareVersionModal extends Modal {
+    constructor(app, plugin, file) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+        this.diffMode = 'unified';
+        this.showOnlyChanges = false;
+        this.ignoreWhitespace = false;
+        this.contextLines = 3;
+        this.version1Index = 0;
+        this.version2Index = 0;
+        this.versions = [];
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+        
+        // 设置 Modal 容器的样式
+        contentEl.style.cssText = 'max-height: 80vh; overflow-y: auto; padding: 20px;';
+
+        contentEl.createEl('h2', { text: '📊 比较版本' });
+        
+        this.versions = this.plugin.getVersions(this.file);
+        
+        if (this.versions.length < 2) {
+            contentEl.createEl('p', { text: '至少需要两个版本才能比较' });
+            return;
+        }
+
+        this.version1Index = this.versions.length > 1 ? this.versions.length - 2 : 0;
+        this.version2Index = this.versions.length - 1;
+
+        const controls = contentEl.createEl('div', { cls: 'diff-controls' });
+        controls.style.marginBottom = '20px';
+
+        // 版本选择器
+        const versionSelectors = controls.createEl('div', { cls: 'version-selectors' });
+
+        new Setting(versionSelectors)
+            .setName('基础版本')
+            .setDesc('选择要对比的旧版本')
+            .addDropdown(dropdown => {
+                this.versions.forEach((v, i) => {
+                    const date = new Date(v.timestamp).toLocaleString('zh-CN', {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                    const name = this.plugin.getVersionName(this.file.path, i);
+                    const label = name ? `${name} (${date})` : `版本 ${i + 1} - ${date}`;
+                    const snapshot = v.isSnapshot ? ' 📌' : '';
+                    dropdown.addOption(i.toString(), label + snapshot);
+                });
+                dropdown.setValue(this.version1Index.toString());
+                dropdown.onChange(value => { 
+                    this.version1Index = parseInt(value);
+                });
+            });
+
+        new Setting(versionSelectors)
+            .setName('对比版本')
+            .setDesc('选择要对比的新版本')
+            .addDropdown(dropdown => {
+                this.versions.forEach((v, i) => {
+                    const date = new Date(v.timestamp).toLocaleString('zh-CN', {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                    const name = this.plugin.getVersionName(this.file.path, i);
+                    const label = name ? `${name} (${date})` : `版本 ${i + 1} - ${date}`;
+                    const snapshot = v.isSnapshot ? ' 📌' : '';
+                    dropdown.addOption(i.toString(), label + snapshot);
+                });
+                dropdown.setValue(this.version2Index.toString());
+                dropdown.onChange(value => { 
+                    this.version2Index = parseInt(value);
+                });
+            });
+
+        // 快速选择按钮
+        const quickSelect = controls.createEl('div', { cls: 'quick-select' });
+        quickSelect.createEl('span', { text: '快速选择: ', cls: 'quick-label' });
+        
+        const btnLatest = quickSelect.createEl('button', { text: '最新两版', cls: 'quick-btn' });
+        btnLatest.addEventListener('click', () => {
+            this.version1Index = Math.max(0, this.versions.length - 2);
+            this.version2Index = this.versions.length - 1;
+            this.updateDropdowns(versionSelectors);
+            this.showDiff(this.versions[this.version1Index], this.versions[this.version2Index]);
+        });
+
+        const btnFirstLast = quickSelect.createEl('button', { text: '首版与末版', cls: 'quick-btn' });
+        btnFirstLast.addEventListener('click', () => {
+            this.version1Index = 0;
+            this.version2Index = this.versions.length - 1;
+            this.updateDropdowns(versionSelectors);
+            this.showDiff(this.versions[this.version1Index], this.versions[this.version2Index]);
+        });
+
+        const btnSnapshots = quickSelect.createEl('button', { text: '快照对比', cls: 'quick-btn' });
+        btnSnapshots.addEventListener('click', () => {
+            const snapshots = this.versions.map((v, i) => ({v, i})).filter(item => item.v.isSnapshot);
+            if (snapshots.length >= 2) {
+                this.version1Index = snapshots[snapshots.length - 2].i;
+                this.version2Index = snapshots[snapshots.length - 1].i;
+                this.updateDropdowns(versionSelectors);
+                this.showDiff(this.versions[this.version1Index], this.versions[this.version2Index]);
+            } else {
+                new Notice('快照版本不足两个');
+            }
+        });
+
+        // 对比选项
+        const options = controls.createEl('div', { cls: 'diff-options' });
+
+        new Setting(options)
+            .setName('显示模式')
+            .addDropdown(dropdown => dropdown
+                .addOption('unified', '统一视图')
+                .addOption('split', '分屏视图')
+                .addOption('inline', '行内高亮')
+                .setValue(this.diffMode)
+                .onChange(value => { this.diffMode = value; }));
+
+        new Setting(options)
+            .setName('只显示变更')
+            .setDesc('隐藏未改变的内容')
+            .addToggle(toggle => toggle
+                .setValue(this.showOnlyChanges)
+                .onChange(value => { this.showOnlyChanges = value; }));
+
+        new Setting(options)
+            .setName('忽略空白')
+            .setDesc('忽略空格和换行的差异')
+            .addToggle(toggle => toggle
+                .setValue(this.ignoreWhitespace)
+                .onChange(value => { this.ignoreWhitespace = value; }));
+
+        new Setting(options)
+            .setName('上下文行数')
+            .setDesc('显示变更周围的行数')
+            .addSlider(slider => slider
+                .setLimits(0, 10, 1)
+                .setValue(this.contextLines)
+                .setDynamicTooltip()
+                .onChange(value => { this.contextLines = value; }));
+
+        // 操作按钮
+        const actions = controls.createEl('div', { cls: 'diff-actions' });
+        actions.style.display = 'flex';
+        actions.style.gap = '10px';
+        actions.style.marginTop = '15px';
+        
+        const compareBtn = actions.createEl('button', { 
+            text: '🔍 开始对比',
+            cls: 'mod-cta'
+        });
+        compareBtn.style.flex = '1';
+        compareBtn.addEventListener('click', () => {
+            try {
+                console.log('点击对比按钮');
+                console.log('版本索引:', this.version1Index, this.version2Index);
+                
+                if (this.version1Index === this.version2Index) {
+                    new Notice('请选择不同的版本');
+                    return;
+                }
+                
+                const v1 = this.versions[this.version1Index];
+                const v2 = this.versions[this.version2Index];
+                
+                if (!v1 || !v2) {
+                    new Notice('版本数据获取失败');
+                    return;
+                }
+                
+                this.showDiff(v1, v2);
+            } catch (error) {
+                console.error('对比按钮点击错误:', error);
+                new Notice('对比失败: ' + error.message);
+            }
+        });
+        
+        const copyBtn = actions.createEl('button', { text: '📋 复制' });
+        copyBtn.style.flex = '1';
+        copyBtn.addEventListener('click', () => {
+            if (!this.currentDiff) {
+                new Notice('请先进行对比');
+                return;
+            }
+            this.copyDiffToClipboard();
+        });
+        
+        const exportBtn = actions.createEl('button', { text: '💾 导出' });
+        exportBtn.style.flex = '1';
+        exportBtn.addEventListener('click', () => {
+            if (!this.currentDiff) {
+                new Notice('请先进行对比');
+                return;
+            }
+            this.exportDiffReport(this.versions[this.version1Index], this.versions[this.version2Index]);
+        });
+
+        // 对比结果容器 - 关键：不嵌套在 controls 里面
+        this.diffContainer = contentEl.createEl('div', { cls: 'diff-container' });
+        this.diffContainer.style.cssText = 'margin-top: 20px; width: 100%; min-height: 300px;';
+        
+        // 自动显示最新两个版本的对比
+        try {
+            console.log('自动显示对比');
+            this.showDiff(this.versions[this.version1Index], this.versions[this.version2Index]);
+        } catch (error) {
+            console.error('自动对比失败:', error);
+            const notice = this.diffContainer.createEl('div');
+            notice.style.cssText = 'padding: 20px; background: #ffeecc; border: 2px solid #ff9900; border-radius: 4px;';
+            notice.textContent = '自动对比失败，请点击"开始对比"按钮';
+        }
+    }
+
+    updateDropdowns(container) {
+        const dropdowns = container.querySelectorAll('select');
+        if (dropdowns[0]) dropdowns[0].value = this.version1Index.toString();
+        if (dropdowns[1]) dropdowns[1].value = this.version2Index.toString();
+    }
+
+    showDiff(v1, v2) {
+        try {
+            console.log('开始对比版本:', v1, v2);
+            
+            if (!v1 || !v2) {
+                new Notice('版本数据无效');
+                return;
+            }
+            
+            // 清空容器
+            this.diffContainer.empty();
+            console.log('已清空容器');
+            
+            this.currentDiff = { v1, v2 };
+
+            const diff = new DiffEngine(v1.content, v2.content, this.ignoreWhitespace);
+            let changes = diff.compute();
+            
+            console.log('计算出的变更数量:', changes.length);
+
+            // 应用过滤
+            if (this.showOnlyChanges) {
+                changes = this.filterChanges(changes);
+            }
+
+            // 美化的统计信息
+            const statsDiv = this.diffContainer.createEl('div');
+            statsDiv.style.cssText = `
+                padding: 20px;
+                margin: 15px 0;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                border-radius: 12px;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+                color: white;
+            `;
+            
+            const addedCount = changes.filter(c => c.type === 'add').length;
+            const removedCount = changes.filter(c => c.type === 'remove').length;
+            
+            statsDiv.innerHTML = `
+                <div style="margin-bottom: 15px;">
+                    <div style="font-size: 16px; font-weight: bold; margin-bottom: 10px; opacity: 0.9;">📊 对比统计</div>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
+                    <div style="background: rgba(255,255,255,0.15); padding: 15px; border-radius: 8px; backdrop-filter: blur(10px);">
+                        <div style="font-size: 12px; opacity: 0.8; margin-bottom: 5px;">📄 基础版本</div>
+                        <div style="font-size: 11px; line-height: 1.6;">
+                            ${new Date(v1.timestamp).toLocaleString('zh-CN', {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'})}<br>
+                            ${v1.comment ? v1.comment : '无备注'}
+                        </div>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.15); padding: 15px; border-radius: 8px; backdrop-filter: blur(10px);">
+                        <div style="font-size: 12px; opacity: 0.8; margin-bottom: 5px;">📄 对比版本</div>
+                        <div style="font-size: 11px; line-height: 1.6;">
+                            ${new Date(v2.timestamp).toLocaleString('zh-CN', {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'})}<br>
+                            ${v2.comment ? v2.comment : '无备注'}
+                        </div>
+                    </div>
+                </div>
+                <div style="display: flex; justify-content: space-around; margin-top: 20px; padding-top: 15px; border-top: 1px solid rgba(255,255,255,0.2);">
+                    <div style="text-align: center;">
+                        <div style="font-size: 24px; font-weight: bold; color: #4ade80;">+${addedCount}</div>
+                        <div style="font-size: 11px; opacity: 0.8;">新增行</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="font-size: 24px; font-weight: bold; color: #f87171;">-${removedCount}</div>
+                        <div style="font-size: 11px; opacity: 0.8;">删除行</div>
+                    </div>
+                    <div style="text-align: center;">
+                        <div style="font-size: 24px; font-weight: bold; color: #fbbf24;">±${Math.min(addedCount, removedCount)}</div>
+                        <div style="font-size: 11px; opacity: 0.8;">修改行</div>
+                    </div>
+                </div>
+            `;
+            
+            console.log('统计信息已添加');
+
+            // 美化的差异渲染
+            const diffDiv = this.diffContainer.createEl('div');
+            diffDiv.style.cssText = `
+                margin-top: 20px;
+                padding: 0;
+                background: #1e1e1e;
+                border-radius: 12px;
+                overflow: hidden;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            `;
+            
+            // 添加标题栏
+            const titleBar = diffDiv.createEl('div');
+            titleBar.style.cssText = `
+                padding: 12px 15px;
+                background: linear-gradient(135deg, #2d3748 0%, #1a202c 100%);
+                color: white;
+                font-size: 13px;
+                font-weight: 600;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            `;
+            titleBar.innerHTML = `
+                <span style="font-size: 16px;">📝</span>
+                <span>差异内容</span>
+                <span style="margin-left: auto; font-size: 11px; opacity: 0.7;">${changes.length > 50 ? '显示前50行' : `共${changes.length}行`}</span>
+            `;
+            
+            const contentDiv = diffDiv.createEl('div');
+            contentDiv.style.cssText = `
+                max-height: 400px;
+                overflow-y: auto;
+                font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+                font-size: 13px;
+                line-height: 1.6;
+            `;
+            
+            if (changes.length === 0) {
+                const emptyDiv = contentDiv.createEl('div');
+                emptyDiv.style.cssText = 'padding: 40px 20px; text-align: center; color: #94a3b8;';
+                emptyDiv.innerHTML = `
+                    <div style="font-size: 48px; margin-bottom: 10px;">✨</div>
+                    <div style="font-size: 14px;">两个版本内容完全相同</div>
+                `;
+            } else {
+                // 只显示前50行变更
+                const displayChanges = changes.slice(0, 50);
+                
+                displayChanges.forEach((change, idx) => {
+                    const lineDiv = contentDiv.createEl('div');
+                    lineDiv.style.cssText = `
+                        padding: 8px 15px;
+                        margin: 0;
+                        border-left: 3px solid transparent;
+                        transition: background-color 0.15s ease;
+                    `;
+                    
+                    let prefix = '  ';
+                    let bgColor = 'transparent';
+                    let textColor = '#e2e8f0';
+                    let borderColor = 'transparent';
+                    
+                    if (change.type === 'add') {
+                        prefix = '+ ';
+                        bgColor = 'rgba(34, 197, 94, 0.15)';
+                        textColor = '#86efac';
+                        borderColor = '#22c55e';
+                        lineDiv.style.cssText += `
+                            background: ${bgColor};
+                            color: ${textColor};
+                            border-left-color: ${borderColor};
+                        `;
+                    } else if (change.type === 'remove') {
+                        prefix = '- ';
+                        bgColor = 'rgba(239, 68, 68, 0.15)';
+                        textColor = '#fca5a5';
+                        borderColor = '#ef4444';
+                        lineDiv.style.cssText += `
+                            background: ${bgColor};
+                            color: ${textColor};
+                            border-left-color: ${borderColor};
+                        `;
+                    } else {
+                        lineDiv.style.cssText += `
+                            color: ${textColor};
+                        `;
+                    }
+                    
+                    const content = this.escapeHtml(change.content);
+                    const displayContent = content || '<span style="opacity: 0.5;">(空行)</span>';
+                    
+                    lineDiv.innerHTML = `
+                        <span style="opacity: 0.5; margin-right: 10px; user-select: none;">${String(idx + 1).padStart(3, ' ')}</span>
+                        <span style="opacity: 0.7; margin-right: 8px;">${prefix}</span>
+                        <span>${displayContent}</span>
+                    `;
+                });
+                
+                if (changes.length > 50) {
+                    const moreDiv = contentDiv.createEl('div');
+                    moreDiv.style.cssText = `
+                        padding: 15px;
+                        text-align: center;
+                        background: linear-gradient(to bottom, transparent, rgba(100,116,139,0.1));
+                        color: #94a3b8;
+                        font-size: 12px;
+                        border-top: 1px solid rgba(148,163,184,0.1);
+                    `;
+                    moreDiv.innerHTML = `
+                        <span style="opacity: 0.7;">⬇️ 还有 ${changes.length - 50} 行变更未显示</span><br>
+                        <span style="font-size: 11px; opacity: 0.5;">可使用"导出报告"功能查看完整内容</span>
+                    `;
+                }
+            }
+            
+            console.log('差异内容已渲染');
+            console.log('对比完成');
+            new Notice('✅ 对比完成');
+            
+        } catch (error) {
+            console.error('对比失败:', error);
+            console.error('错误堆栈:', error.stack);
+            new Notice('对比失败: ' + error.message);
+            
+            // 显示错误信息
+            this.diffContainer.empty();
+            const errorDiv = this.diffContainer.createEl('div');
+            errorDiv.style.cssText = `
+                padding: 25px;
+                background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+                color: white;
+                border-radius: 12px;
+                margin: 15px 0;
+                box-shadow: 0 4px 15px rgba(239,68,68,0.3);
+            `;
+            errorDiv.innerHTML = `
+                <div style="font-size: 16px; font-weight: bold; margin-bottom: 10px;">❌ 对比出错</div>
+                <div style="font-size: 13px; opacity: 0.9;">${error.message}</div>
+            `;
+        }
+    }
+
+    filterChanges(changes) {
+        const filtered = [];
+        const contextLines = this.contextLines;
+        
+        for (let i = 0; i < changes.length; i++) {
+            if (changes[i].type !== 'context') {
+                // 添加变更行
+                filtered.push(changes[i]);
+                
+                // 添加上下文
+                for (let j = Math.max(0, i - contextLines); j < i; j++) {
+                    if (changes[j].type === 'context' && !filtered.includes(changes[j])) {
+                        filtered.push({ ...changes[j], isContext: true });
+                    }
+                }
+                for (let j = i + 1; j <= Math.min(changes.length - 1, i + contextLines); j++) {
+                    if (changes[j].type === 'context') {
+                        filtered.push({ ...changes[j], isContext: true });
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        return filtered;
+    }
+
+    async copyDiffToClipboard() {
+        const { v1, v2 } = this.currentDiff;
+        let text = `版本对比\n`;
+        text += `基础版本: ${new Date(v1.timestamp).toLocaleString('zh-CN')}\n`;
+        text += `对比版本: ${new Date(v2.timestamp).toLocaleString('zh-CN')}\n\n`;
+        
+        const diff = new DiffEngine(v1.content, v2.content, this.ignoreWhitespace);
+        const changes = diff.compute();
+        
+        changes.forEach(change => {
+            if (change.type === 'add') {
+                text += `+ ${change.content}\n`;
+            } else if (change.type === 'remove') {
+                text += `- ${change.content}\n`;
+            } else if (!this.showOnlyChanges) {
+                text += `  ${change.content}\n`;
+            }
+        });
+        
+        await navigator.clipboard.writeText(text);
+        new Notice('差异已复制到剪贴板');
+    }
+
+    async exportDiffReport(v1, v2) {
+        const diff = new DiffEngine(v1.content, v2.content, this.ignoreWhitespace);
+        const changes = diff.compute();
+        const stats = this.plugin.analyzeDiffStats(changes);
+        
+        let report = `# 版本差异报告\n\n`;
+        report += `## 基本信息\n\n`;
+        report += `- 文件: ${this.file.path}\n`;
+        report += `- 生成时间: ${new Date().toLocaleString('zh-CN')}\n\n`;
+        
+        report += `## 版本对比\n\n`;
+        report += `### 基础版本 (v${this.plugin.getVersions(this.file).indexOf(v1) + 1})\n`;
+        report += `- 时间: ${new Date(v1.timestamp).toLocaleString('zh-CN')}\n`;
+        report += `- 备注: ${v1.comment || '无'}\n`;
+        report += `- 大小: ${this.plugin.formatSize(v1.size)}\n`;
+        report += `- 行数: ${v1.metadata?.lineCount || v1.content.split('\n').length}\n\n`;
+        
+        report += `### 对比版本 (v${this.plugin.getVersions(this.file).indexOf(v2) + 1})\n`;
+        report += `- 时间: ${new Date(v2.timestamp).toLocaleString('zh-CN')}\n`;
+        report += `- 备注: ${v2.comment || '无'}\n`;
+        report += `- 大小: ${this.plugin.formatSize(v2.size)}\n`;
+        report += `- 行数: ${v2.metadata?.lineCount || v2.content.split('\n').length}\n\n`;
+        
+        report += `## 变更统计\n\n`;
+        report += `- ➕ 新增: ${stats.added} 行\n`;
+        report += `- ➖ 删除: ${stats.removed} 行\n`;
+        report += `- ✏️ 修改: ${stats.modified} 行\n`;
+        report += `- 📊 总变更: ${stats.added + stats.removed} 行\n\n`;
+        
+        report += `## 详细差异\n\n`;
+        report += '```diff\n';
+        changes.forEach(change => {
+            if (change.type === 'add') {
+                report += `+ ${change.content}\n`;
+            } else if (change.type === 'remove') {
+                report += `- ${change.content}\n`;
+            } else {
+                report += `  ${change.content}\n`;
+            }
+        });
+        report += '```\n';
+        
+        const fileName = `${this.file.basename}_差异报告_${new Date().toISOString().split('T')[0]}.md`;
+        await this.plugin.app.vault.create(fileName, report);
+        new Notice(`差异报告已导出: ${fileName}`);
+    }
+
+    renderUnifiedDiff(changes) {
+        const viewEl = this.diffContainer.createEl('div', { cls: 'diff-view unified' });
+        
+        // 确保容器可见
+        viewEl.style.minHeight = '200px';
+        viewEl.style.border = '1px solid var(--background-modifier-border)';
+        viewEl.style.padding = '10px';
+        viewEl.style.marginTop = '10px';
+        
+        if (changes.length === 0) {
+            viewEl.createEl('div', { text: '两个版本内容相同，没有差异', cls: 'no-changes' });
+            return;
+        }
+        
+        let lineNum1 = 1, lineNum2 = 1;
+        
+        changes.forEach(change => {
+            const lineEl = viewEl.createEl('div', { cls: 'diff-line' });
+            lineEl.style.minHeight = '20px';
+            lineEl.style.padding = '2px 0';
+            
+            const lineNumbers = lineEl.createEl('span', { cls: 'line-numbers' });
+            lineNumbers.style.display = 'inline-block';
+            lineNumbers.style.marginRight = '10px';
+            lineNumbers.style.minWidth = '80px';
+            
+            if (change.type === 'context') {
+                lineNumbers.createEl('span', { 
+                    cls: 'line-num old', 
+                    text: lineNum1.toString() 
+                });
+                lineNumbers.createEl('span', { 
+                    cls: 'line-num new', 
+                    text: ' | ' + lineNum2.toString() 
+                });
+                lineEl.addClass('diff-context');
+                lineEl.style.backgroundColor = 'transparent';
+                lineEl.createEl('span', { cls: 'line-content', text: '  ' + change.content });
+                lineNum1++;
+                lineNum2++;
+            } else if (change.type === 'remove') {
+                lineNumbers.createEl('span', { 
+                    cls: 'line-num old', 
+                    text: lineNum1.toString() 
+                });
+                lineNumbers.createEl('span', { 
+                    cls: 'line-num new empty', 
+                    text: ' |  ' 
+                });
+                lineEl.addClass('diff-removed');
+                lineEl.style.backgroundColor = 'rgba(220, 53, 69, 0.15)';
+                lineEl.createEl('span', { 
+                    cls: 'line-content', 
+                    text: '- ' + change.content 
+                }).style.color = '#dc3545';
+                lineNum1++;
+            } else if (change.type === 'add') {
+                lineNumbers.createEl('span', { 
+                    cls: 'line-num old empty', 
+                    text: '   ' 
+                });
+                lineNumbers.createEl('span', { 
+                    cls: 'line-num new', 
+                    text: '| ' + lineNum2.toString() 
+                });
+                lineEl.addClass('diff-added');
+                lineEl.style.backgroundColor = 'rgba(40, 167, 69, 0.15)';
+                lineEl.createEl('span', { 
+                    cls: 'line-content', 
+                    text: '+ ' + change.content 
+                }).style.color = '#28a745';
+                lineNum2++;
+            }
+        });
+        
+        console.log('渲染了', changes.length, '行差异');
+    }
+
+    renderSplitDiff(content1, content2, changes) {
+        const viewEl = this.diffContainer.createEl('div', { cls: 'diff-view split' });
+        
+        // 内联样式确保显示
+        viewEl.style.display = 'grid';
+        viewEl.style.gridTemplateColumns = '1fr 1fr';
+        viewEl.style.border = '1px solid var(--background-modifier-border)';
+        viewEl.style.marginTop = '10px';
+        viewEl.style.minHeight = '200px';
+        
+        const leftEl = viewEl.createEl('div', { cls: 'diff-side left' });
+        leftEl.style.borderRight = '2px solid var(--background-modifier-border)';
+        leftEl.style.padding = '10px';
+        leftEl.style.overflowX = 'auto';
+        
+        const rightEl = viewEl.createEl('div', { cls: 'diff-side right' });
+        rightEl.style.padding = '10px';
+        rightEl.style.overflowX = 'auto';
+        
+        const lines1 = content1.split('\n');
+        const lines2 = content2.split('\n');
+        
+        let idx1 = 0, idx2 = 0;
+        
+        changes.forEach(change => {
+            if (change.type === 'context') {
+                const line = leftEl.createEl('div', { cls: 'diff-line context' });
+                line.textContent = change.content;
+                line.style.padding = '2px 5px';
+                
+                const line2 = rightEl.createEl('div', { cls: 'diff-line context' });
+                line2.textContent = change.content;
+                line2.style.padding = '2px 5px';
+                
+                idx1++;
+                idx2++;
+            } else if (change.type === 'remove') {
+                const line = leftEl.createEl('div', { cls: 'diff-line removed' });
+                line.textContent = change.content;
+                line.style.backgroundColor = 'rgba(220, 53, 69, 0.15)';
+                line.style.color = '#dc3545';
+                line.style.padding = '2px 5px';
+                
+                const spacer = rightEl.createEl('div', { cls: 'diff-line spacer' });
+                spacer.style.backgroundColor = 'var(--background-primary-alt)';
+                spacer.style.minHeight = '20px';
+                idx1++;
+            } else if (change.type === 'add') {
+                const spacer = leftEl.createEl('div', { cls: 'diff-line spacer' });
+                spacer.style.backgroundColor = 'var(--background-primary-alt)';
+                spacer.style.minHeight = '20px';
+                
+                const line2 = rightEl.createEl('div', { cls: 'diff-line added' });
+                line2.textContent = change.content;
+                line2.style.backgroundColor = 'rgba(40, 167, 69, 0.15)';
+                line2.style.color = '#28a745';
+                line2.style.padding = '2px 5px';
+                
+                idx2++;
+            }
+        });
+        
+        console.log('分屏渲染完成');
+    }
+
+    renderInlineDiff(content1, content2) {
+        const viewEl = this.diffContainer.createEl('div', { cls: 'diff-view inline' });
+        
+        // 内联样式确保显示
+        viewEl.style.border = '1px solid var(--background-modifier-border)';
+        viewEl.style.marginTop = '10px';
+        viewEl.style.minHeight = '200px';
+        
+        const lines1 = content1.split('\n');
+        const lines2 = content2.split('\n');
+        
+        const maxLine = Math.max(lines1.length, lines2.length);
+        
+        for (let i = 0; i < maxLine; i++) {
+            const line1 = lines1[i] || '';
+            const line2 = lines2[i] || '';
+            
+            const lineEl = viewEl.createEl('div', { cls: 'diff-line-pair' });
+            lineEl.style.display = 'grid';
+            lineEl.style.gridTemplateColumns = '1fr 1fr';
+            lineEl.style.borderBottom = '1px solid var(--background-modifier-border)';
+            
+            const leftPart = lineEl.createEl('div', { cls: 'diff-line-part left' });
+            leftPart.style.padding = '5px 10px';
+            leftPart.style.borderRight = '1px solid var(--background-modifier-border)';
+            leftPart.style.wordBreak = 'break-all';
+            
+            const rightPart = lineEl.createEl('div', { cls: 'diff-line-part right' });
+            rightPart.style.padding = '5px 10px';
+            rightPart.style.wordBreak = 'break-all';
+            
+            if (line1 === line2) {
+                leftPart.addClass('context');
+                rightPart.addClass('context');
+                leftPart.textContent = line1;
+                rightPart.textContent = line2;
+            } else {
+                if (line1) {
+                    leftPart.addClass('removed');
+                    leftPart.style.backgroundColor = 'rgba(220, 53, 69, 0.15)';
+                    leftPart.innerHTML = this.highlightChanges(line1, line2);
+                }
+                if (line2) {
+                    rightPart.addClass('added');
+                    rightPart.style.backgroundColor = 'rgba(40, 167, 69, 0.15)';
+                    rightPart.innerHTML = this.highlightChanges(line2, line1);
+                }
+            }
+        }
+        
+        console.log('行内渲染完成');
+    }
+
+    highlightChanges(current, other) {
+        const chars1 = current.split('');
+        const chars2 = other.split('');
+        
+        let result = '';
+        let i = 0;
+        
+        while (i < chars1.length) {
+            if (i < chars2.length && chars1[i] === chars2[i]) {
+                result += this.escapeHtml(chars1[i]);
+                i++;
+            } else {
+                let j = i;
+                let changed = '';
+                while (j < chars1.length && (j >= chars2.length || chars1[j] !== chars2[j])) {
+                    changed += chars1[j];
+                    j++;
+                }
+                result += `<mark>${this.escapeHtml(changed)}</mark>`;
+                i = j;
+            }
+        }
+        
+        return result;
+    }
+
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+// 新增: 变更预览Modal
+class ChangePreviewModal extends Modal {
+    constructor(app, changes) {
+        super(app);
+        this.changes = changes;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '📊 变更预览' });
+
+        const addedCount = this.changes.filter(c => c.type === 'add').length;
+        const removedCount = this.changes.filter(c => c.type === 'remove').length;
+
+        const stats = contentEl.createEl('div', { cls: 'change-stats' });
+        stats.createEl('span', { text: `➕ 新增 ${addedCount} 行` });
+        stats.createEl('span', { text: ` | ` });
+        stats.createEl('span', { text: `➖ 删除 ${removedCount} 行` });
+
+        const previewEl = contentEl.createEl('div', { cls: 'change-preview' });
+        
+        this.changes.forEach(change => {
+            const lineEl = previewEl.createEl('div', { cls: 'preview-line' });
+            
+            if (change.type === 'add') {
+                lineEl.addClass('added');
+                lineEl.textContent = '+ ' + change.content;
+            } else if (change.type === 'remove') {
+                lineEl.addClass('removed');
+                lineEl.textContent = '- ' + change.content;
+            } else {
+                lineEl.addClass('context');
+                lineEl.textContent = '  ' + change.content;
+            }
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+// 新增: 合并版本Modal
+class MergeVersionModal extends Modal {
+    constructor(app, plugin, file) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '🔀 合并版本' });
+        contentEl.createEl('p', { text: '选择要合并的版本' });
+
+        const versions = this.plugin.getVersions(this.file);
+        
+        if (versions.length < 2) {
+            contentEl.createEl('p', { text: '至少需要两个版本才能合并' });
+            return;
+        }
+
+        let baseVersionIndex = 0;
+        let mergeVersionIndex = versions.length - 1;
+
+        new Setting(contentEl)
+            .setName('基础版本')
+            .addDropdown(dropdown => {
+                versions.forEach((v, i) => {
+                    const date = new Date(v.timestamp).toLocaleString('zh-CN');
+                    dropdown.addOption(i.toString(), `版本 ${i + 1} - ${date}`);
+                });
+                dropdown.onChange(value => { baseVersionIndex = parseInt(value); });
+            });
+
+        new Setting(contentEl)
+            .setName('合并版本')
+            .addDropdown(dropdown => {
+                versions.forEach((v, i) => {
+                    const date = new Date(v.timestamp).toLocaleString('zh-CN');
+                    dropdown.addOption(i.toString(), `版本 ${i + 1} - ${date}`);
+                });
+                dropdown.setValue(mergeVersionIndex.toString());
+                dropdown.onChange(value => { mergeVersionIndex = parseInt(value); });
+            });
+
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('合并').setCta().onClick(async () => {
+                if (baseVersionIndex === mergeVersionIndex) {
+                    new Notice('请选择不同的版本');
+                    return;
+                }
+                
+                const baseVersion = versions[baseVersionIndex];
+                const mergeVersion = versions[mergeVersionIndex];
+                
+                // 简单合并策略: 使用较新版本的内容
+                const mergedContent = mergeVersion.content;
+                
+                await this.plugin.app.vault.modify(this.file, mergedContent);
+                await this.plugin.saveVersion(this.file, `合并版本 ${baseVersionIndex + 1} 和 ${mergeVersionIndex + 1}`);
+                
+                new Notice('版本已合并');
+                this.close();
+            }))
+            .addButton(btn => btn.setButtonText('取消').onClick(() => this.close()));
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+// 新增: 标签版本Modal
+class TagVersionModal extends Modal {
+    constructor(app, plugin, file) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+        this.selectedVersion = -1;
+        this.newTag = '';
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '🏷️ 管理版本标签' });
+
+        const versions = this.plugin.getVersions(this.file);
+        
+        if (versions.length === 0) {
+            contentEl.createEl('p', { text: '暂无版本' });
+            return;
+        }
+
+        new Setting(contentEl)
+            .setName('选择版本')
+            .addDropdown(dropdown => {
+                versions.forEach((v, i) => {
+                    const date = new Date(v.timestamp).toLocaleString('zh-CN');
+                    dropdown.addOption(i.toString(), `版本 ${i + 1} - ${date}`);
+                });
+                dropdown.setValue((versions.length - 1).toString());
+                dropdown.onChange(value => { 
+                    this.selectedVersion = parseInt(value);
+                    this.displayCurrentTags();
+                });
+                this.selectedVersion = versions.length - 1;
+            });
+
+        this.tagsContainer = contentEl.createEl('div', { cls: 'tags-container' });
+        this.displayCurrentTags();
+
+        new Setting(contentEl)
+            .setName('新标签')
+            .addText(text => text
+                .setPlaceholder('输入标签名称')
+                .onChange(value => { this.newTag = value; }));
+
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('添加标签').setCta().onClick(() => {
+                if (this.newTag && this.selectedVersion >= 0) {
+                    this.plugin.addVersionTag(this.file.path, this.selectedVersion, this.newTag);
+                    this.newTag = '';
+                    this.displayCurrentTags();
+                    new Notice('标签已添加');
+                }
+            }))
+            .addButton(btn => btn.setButtonText('关闭').onClick(() => this.close()));
+    }
+
+    displayCurrentTags() {
+        this.tagsContainer.empty();
+        
+        if (this.selectedVersion < 0) return;
+
+        const tags = this.plugin.getVersionTags(this.file.path, this.selectedVersion);
+        
+        if (tags.length === 0) {
+            this.tagsContainer.createEl('p', { text: '暂无标签' });
+            return;
+        }
+
+        this.tagsContainer.createEl('h4', { text: '当前标签:' });
+        const tagList = this.tagsContainer.createEl('div', { cls: 'tag-list' });
+        
+        tags.forEach(tag => {
+            const tagEl = tagList.createEl('span', { cls: 'tag-item', text: tag });
+            const removeBtn = tagEl.createEl('span', { cls: 'tag-remove', text: ' ×' });
+            removeBtn.addEventListener('click', () => {
+                // 移除标签逻辑
+                const currentTags = this.plugin.getVersionTags(this.file.path, this.selectedVersion);
+                const index = currentTags.indexOf(tag);
+                if (index > -1) {
+                    currentTags.splice(index, 1);
+                    this.plugin.saveVersionData();
+                    this.displayCurrentTags();
+                }
+            });
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+// 新增: 时间线Modal
+class TimelineModal extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '📅 版本时间线' });
+
+        const allVersions = [];
+        const versionData = this.plugin.getAllVersions();
+
+        for (const filePath in versionData) {
+            versionData[filePath].forEach((version, index) => {
+                allVersions.push({
+                    filePath,
+                    version,
+                    index
+                });
+            });
+        }
+
+        allVersions.sort((a, b) => b.version.timestamp - a.version.timestamp);
+
+        if (allVersions.length === 0) {
+            contentEl.createEl('p', { text: '暂无版本历史' });
+            return;
+        }
+
+        const timeline = contentEl.createEl('div', { cls: 'timeline' });
+
+        allVersions.slice(0, 50).forEach(item => {
+            const timelineItem = timeline.createEl('div', { cls: 'timeline-item' });
+            
+            const date = new Date(item.version.timestamp);
+            const dateStr = date.toLocaleString('zh-CN');
+            
+            timelineItem.createEl('div', { 
+                text: dateStr,
+                cls: 'timeline-date'
+            });
+            
+            timelineItem.createEl('div', { 
+                text: item.filePath,
+                cls: 'timeline-file'
+            });
+            
+            if (item.version.comment) {
+                timelineItem.createEl('div', { 
+                    text: item.version.comment,
+                    cls: 'timeline-comment'
+                });
+            }
+            
+            if (item.version.isSnapshot) {
+                timelineItem.createEl('span', { 
+                    text: '📌 快照',
+                    cls: 'timeline-badge'
+                });
+            }
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class SnapshotModal extends Modal {
+    constructor(app, plugin, file) {
+        super(app);
+        this.plugin = plugin;
+        this.file = file;
+        this.comment = '';
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '📌 创建快照' });
+        contentEl.createEl('p', { text: '快照是受保护的版本,不会被自动清理' });
+        contentEl.createEl('p', { text: `文件: ${this.file.name}` });
+
+        new Setting(contentEl)
+            .setName('快照说明')
+            .setDesc('描述这个快照的重要性')
+            .addTextArea(text => text
+                .setPlaceholder('例如:重大功能完成前的稳定版本')
+                .onChange(value => { this.comment = value; }));
+
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('创建快照').setCta().onClick(() => {
+                this.plugin.saveVersion(this.file, this.comment || '快照', true);
+                this.close();
+            }))
+            .addButton(btn => btn.setButtonText('取消').onClick(() => this.close()));
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class CleanupModal extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+        this.daysOld = 30;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '🗑️ 清理旧版本' });
+        
+        const stats = this.getStats();
+        contentEl.createEl('p', { text: `当前有 ${stats.totalVersions} 个版本,占用 ${this.plugin.formatSize(stats.totalSize)}` });
+
+        new Setting(contentEl)
+            .setName('清理时间')
+            .setDesc('删除多少天前的版本(快照除外)')
+            .addSlider(slider => slider
+                .setLimits(7, 365, 1)
+                .setValue(this.daysOld)
+                .setDynamicTooltip()
+                .onChange(value => {
+                    this.daysOld = value;
+                    this.updatePreview();
+                }));
+
+        this.previewEl = contentEl.createEl('div', { cls: 'cleanup-preview' });
+        this.updatePreview();
+
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('执行清理').setWarning().onClick(async () => {
+                const removed = await this.plugin.cleanupOldVersions(this.daysOld);
+                new Notice(`已清理 ${removed} 个版本`);
+                this.close();
+            }))
+            .addButton(btn => btn.setButtonText('取消').onClick(() => this.close()));
+    }
+
+    getStats() {
+        const versionData = this.plugin.getAllVersions();
+        let totalVersions = 0;
+        let totalSize = 0;
+        
+        for (const filePath in versionData) {
+            totalVersions += versionData[filePath].length;
+            versionData[filePath].forEach(v => {
+                totalSize += v.size || 0;
+            });
+        }
+        
+        return { totalVersions, totalSize };
+    }
+
+    updatePreview() {
+        const cutoffTime = Date.now() - (this.daysOld * 24 * 60 * 60 * 1000);
+        let toRemove = 0;
+        
+        const versionData = this.plugin.getAllVersions();
+        for (const filePath in versionData) {
+            versionData[filePath].forEach(v => {
+                if (!v.isSnapshot && v.timestamp < cutoffTime) {
+                    toRemove++;
+                }
+            });
+        }
+        
+        this.previewEl.setText(`将删除 ${toRemove} 个版本`);
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class StatsModal extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '📊 版本统计' });
+
+        const versionData = this.plugin.getAllVersions();
+        const stats = this.calculateStats(versionData);
+
+        const statsContainer = contentEl.createEl('div', { cls: 'stats-container' });
+
+        this.addStatItem(statsContainer, '总版本数', stats.totalVersions);
+        this.addStatItem(statsContainer, '总占用空间', this.plugin.formatSize(stats.totalSize));
+        this.addStatItem(statsContainer, '文件数', stats.fileCount);
+        this.addStatItem(statsContainer, '快照数', stats.snapshotCount);
+        this.addStatItem(statsContainer, '平均版本/文件', stats.avgVersions.toFixed(1));
+        this.addStatItem(statsContainer, '最大版本数', stats.maxVersionsPerFile);
+
+        contentEl.createEl('h3', { text: '文件版本详情' });
+        const fileList = contentEl.createEl('div', { cls: 'file-list' });
+
+        stats.fileDetails.forEach(detail => {
+            const fileItem = fileList.createEl('div', { cls: 'file-item' });
+            fileItem.createEl('div', { text: detail.path, cls: 'file-path' });
+            fileItem.createEl('div', { 
+                text: `${detail.versions} 个版本 | ${this.plugin.formatSize(detail.size)}`,
+                cls: 'file-info'
+            });
+        });
+    }
+
+    calculateStats(versionData) {
+        let totalVersions = 0;
+        let totalSize = 0;
+        let snapshotCount = 0;
+        let maxVersionsPerFile = 0;
+        const fileDetails = [];
+
+        for (const filePath in versionData) {
+            const versions = versionData[filePath];
+            totalVersions += versions.length;
+            maxVersionsPerFile = Math.max(maxVersionsPerFile, versions.length);
+            
+            let fileSize = 0;
+            versions.forEach(v => {
+                totalSize += v.size || 0;
+                fileSize += v.size || 0;
+                if (v.isSnapshot) snapshotCount++;
+            });
+
+            fileDetails.push({
+                path: filePath,
+                versions: versions.length,
+                size: fileSize
+            });
+        }
+
+        fileDetails.sort((a, b) => b.versions - a.versions);
+
+        return {
+            totalVersions,
+            totalSize,
+            fileCount: Object.keys(versionData).length,
+            snapshotCount,
+            maxVersionsPerFile,
+            avgVersions: totalVersions / Math.max(1, Object.keys(versionData).length),
+            fileDetails: fileDetails.slice(0, 10)
+        };
+    }
+
+    addStatItem(container, label, value) {
+        const item = container.createEl('div', { cls: 'stat-item' });
+        item.createEl('div', { text: label, cls: 'stat-label' });
+        item.createEl('div', { text: value.toString(), cls: 'stat-value' });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class SearchVersionModal extends Modal {
+    constructor(app, plugin) {
+        super(app);
+        this.plugin = plugin;
+        this.query = '';
+        this.results = [];
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: '🔍 搜索版本' });
+
+        new Setting(contentEl)
+            .setName('搜索内容')
+            .setDesc('在所有版本中搜索文本')
+            .addText(text => text
+                .setPlaceholder('输入搜索关键字...')
+                .onChange(value => { this.query = value; }));
+
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('搜索').setCta().onClick(() => {
+                this.performSearch();
+            }))
+            .addButton(btn => btn.setButtonText('清空').onClick(() => {
+                this.resultsContainer.empty();
+                this.results = [];
+            }));
+
+        this.resultsContainer = contentEl.createEl('div', { cls: 'search-results' });
+    }
+
+    performSearch() {
+        if (!this.query) {
+            new Notice('请输入搜索关键字');
+            return;
+        }
+
+        this.results = this.plugin.searchInVersions(this.query);
+        this.renderResults();
+    }
+
+    renderResults() {
+        this.resultsContainer.empty();
+
+        if (this.results.length === 0) {
+            this.resultsContainer.createEl('p', { text: '未找到匹配的版本' });
+            return;
+        }
+
+        const maxResults = this.plugin.settings.maxSearchResults;
+        const displayCount = Math.min(this.results.length, maxResults);
+        
+        this.resultsContainer.createEl('p', { 
+            text: `找到 ${this.results.length} 个匹配结果 (显示前 ${displayCount} 个)` 
+        });
+
+        const resultList = this.resultsContainer.createEl('div', { cls: 'result-list' });
+
+        this.results.slice(0, maxResults).forEach(result => {
+            const resultItem = resultList.createEl('div', { cls: 'result-item' });
+            
+            resultItem.createEl('div', { 
+                text: result.filePath,
+                cls: 'result-file'
+            });
+            
+            const date = new Date(result.version.timestamp).toLocaleString('zh-CN');
+            resultItem.createEl('div', { 
+                text: `版本 ${result.versionIndex + 1} - ${date}`,
+                cls: 'result-info'
+            });
+            
+            if (result.version.comment) {
+                resultItem.createEl('div', { 
+                    text: `备注: ${result.version.comment}`,
+                    cls: 'result-comment'
+                });
+            }
+            
+            resultItem.createEl('div', { 
+                text: result.excerpt,
+                cls: 'result-excerpt'
+            });
+
+            resultItem.createEl('button', { text: '查看' }).addEventListener('click', () => {
+                new ViewVersionModal(this.plugin.app, result.version).open();
+            });
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class VersionControlSettingTab extends PluginSettingTab {
+    constructor(app, plugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display() {
+        const { containerEl } = this;
+        containerEl.empty();
+
+        containerEl.createEl('h2', { text: '版本控制设置' });
+
+        // 界面设置
+        containerEl.createEl('h3', { text: '界面设置' });
+
+        new Setting(containerEl)
+            .setName('显示状态栏')
+            .setDesc('在底部状态栏显示版本统计信息')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.showStatusBar)
+                .onChange(async (value) => {
+                    this.plugin.settings.showStatusBar = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.updateStatusBar();
+                }));
+
+        new Setting(containerEl)
+            .setName('显示通知')
+            .setDesc('在保存版本时显示通知')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.showNotifications)
+                .onChange(async (value) => {
+                    this.plugin.settings.showNotifications = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // 基础设置
+        containerEl.createEl('h3', { text: '基础设置' });
+
+        new Setting(containerEl)
+            .setName('最大版本数')
+            .setDesc('每个文件保留的最大版本数量(快照除外)')
+            .addSlider(slider => slider
+                .setLimits(5, 100, 5)
+                .setValue(this.plugin.settings.maxVersions)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.maxVersions = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // 自动保存
+        containerEl.createEl('h3', { text: '自动保存' });
+
+        new Setting(containerEl)
+            .setName('启用自动保存')
+            .setDesc('在文件修改后自动保存版本')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableAutoSave)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableAutoSave = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('自动保存间隔')
+            .setDesc('文件修改后多久自动保存(分钟)')
+            .addSlider(slider => slider
+                .setLimits(1, 60, 1)
+                .setValue(this.plugin.settings.autoSaveInterval)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.autoSaveInterval = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('基于变更次数自动保存')
+            .setDesc('达到指定变更次数时自动保存')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.autoSaveOnChange)
+                .onChange(async (value) => {
+                    this.plugin.settings.autoSaveOnChange = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('最小变更次数')
+            .setDesc('触发自动保存所需的最小变更次数')
+            .addSlider(slider => slider
+                .setLimits(5, 50, 5)
+                .setValue(this.plugin.settings.autoSaveMinChanges)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.autoSaveMinChanges = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('启用自动快照')
+            .setDesc('定时自动创建快照')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableAutoSnapshot)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableAutoSnapshot = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('自动快照间隔')
+            .setDesc('自动创建快照的间隔(分钟)')
+            .addSlider(slider => slider
+                .setLimits(30, 1440, 30)
+                .setValue(this.plugin.settings.autoSnapshotInterval)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.autoSnapshotInterval = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('启用自动清理')
+            .setDesc('自动删除超过指定天数的旧版本')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableAutoCleanup)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableAutoCleanup = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('自动清理天数')
+            .setDesc('删除超过多少天的版本(快照除外)')
+            .addSlider(slider => slider
+                .setLimits(7, 365, 7)
+                .setValue(this.plugin.settings.autoCleanupDays)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.autoCleanupDays = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // 侧边栏设置
+        containerEl.createEl('h3', { text: '侧边栏设置' });
+
+        new Setting(containerEl)
+            .setName('显示内容预览')
+            .setDesc('在侧边栏显示版本内容预览')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.sidebarShowPreview)
+                .onChange(async (value) => {
+                    this.plugin.settings.sidebarShowPreview = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.updateSidebar();
+                }));
+
+        new Setting(containerEl)
+            .setName('紧凑模式')
+            .setDesc('使用紧凑布局显示更多版本')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.sidebarCompactMode)
+                .onChange(async (value) => {
+                    this.plugin.settings.sidebarCompactMode = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.updateSidebar();
+                }));
+
+        new Setting(containerEl)
+            .setName('显示版本数量')
+            .setDesc('侧边栏最多显示的版本数量')
+            .addSlider(slider => slider
+                .setLimits(5, 20, 1)
+                .setValue(this.plugin.settings.sidebarMaxVersions)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.sidebarMaxVersions = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.updateSidebar();
+                }));
+
+        containerEl.createEl('h3', { text: '高级设置' });
+
+        new Setting(containerEl)
+            .setName('启用版本命名')
+            .setDesc('允许为版本设置自定义名称')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableVersionNaming)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableVersionNaming = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('启用标签')
+            .setDesc('允许为版本添加标签')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableTags)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableTags = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('启用差异高亮')
+            .setDesc('在比较版本时高亮显示差异')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableDiffHighlight)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableDiffHighlight = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('显示变更预览')
+            .setDesc('在保存前显示变更预览')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.showChangePreview)
+                .onChange(async (value) => {
+                    this.plugin.settings.showChangePreview = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('启用版本合并')
+            .setDesc('允许合并多个版本')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableVersionMerge)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableVersionMerge = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('保护快照')
+            .setDesc('快照不会被自动清理')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.preserveSnapshots)
+                .onChange(async (value) => {
+                    this.plugin.settings.preserveSnapshots = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('最大搜索结果')
+            .setDesc('搜索版本时显示的最大结果数')
+            .addSlider(slider => slider
+                .setLimits(10, 200, 10)
+                .setValue(this.plugin.settings.maxSearchResults)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.maxSearchResults = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        containerEl.createEl('h3', { text: '维护操作' });
+
+        new Setting(containerEl)
+            .setName('查看统计')
+            .setDesc('查看版本使用统计信息')
+            .addButton(btn => btn.setButtonText('打开').onClick(() => {
+                new StatsModal(this.app, this.plugin).open();
+            }));
+
+        new Setting(containerEl)
+            .setName('清理旧版本')
+            .setDesc('手动清理旧的版本')
+            .addButton(btn => btn.setButtonText('清理').onClick(() => {
+                new CleanupModal(this.app, this.plugin).open();
+            }));
+
+        new Setting(containerEl)
+            .setName('版本时间线')
+            .setDesc('查看所有文件的版本时间线')
+            .addButton(btn => btn.setButtonText('查看').onClick(() => {
+                new TimelineModal(this.app, this.plugin).open();
+            }));
+    }
+}
+
+module.exports = VersionControlPlugin;

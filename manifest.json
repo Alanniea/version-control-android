@@ -1,0 +1,10 @@
+{
+  "id": "version-control-android",
+  "name": "版本控制 (安卓优化)",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "为Obsidian提供版本控制功能，支持版本保存、恢复和比较。特别优化安卓端体验。",
+  "author": "Your Name",
+  "authorUrl": "https://your-website.com",
+  "isDesktopOnly": false
+}
